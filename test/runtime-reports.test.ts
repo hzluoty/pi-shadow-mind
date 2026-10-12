@@ -16,12 +16,13 @@ interface Internals {
   registry: { initialize: () => Promise<void> };
   usageStore: { add: () => Promise<void>; initialize: () => Promise<void>; flush: () => Promise<void> };
   latestContext?: ExtensionContext;
-  sessionLifetime: { activate: () => void; deactivate: () => void };
+  sessionLifetime: { activate: () => void; deactivate: () => void; isActive: boolean };
   registerUi: () => void;
   registerEvents: () => void;
   refresh: () => Promise<{ shadows: []; diagnostics: [] }>;
   statusLines: () => string[];
   deliverReports: (reports: ShadowReport[]) => Promise<void>;
+  recentEvents: Array<{ kind: string }>;
   handleRunEnd: (id: string, shadow: ShadowDefinition, result: ShadowRunResult) => void;
 }
 const shadow = parseShadowMarkdown("---\nid: reviewer\n---\nReview", "reviewer.md");
@@ -92,6 +93,9 @@ describe("delivered reports through the runtime command and real viewer", () => 
     expect(h.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
       customType: "shadow-report", content: expect.stringContaining("REPORT_BODY"),
     }), { triggerTurn: true, deliverAs: "followUp" });
+    expect(
+      h.internal.recentEvents.filter((event) => event.kind === "report-delivered"),
+    ).toHaveLength(1);
     h.input("\x1b");
     await pending;
     expect(h.closed()).toBe(1);
@@ -171,6 +175,30 @@ describe("delivered reports through the runtime command and real viewer", () => 
     await h.internal.deliverReports([report()]);
     await h.command("reports");
     expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(h.custom).not.toHaveBeenCalled();
+  });
+
+  it("contains stale-context errors while checking idleness for a delayed delivery", async () => {
+    const h = harness();
+    const staleContext = {
+      ...h.ctx,
+      isIdle: () => {
+        throw new Error("This extension ctx is stale after session replacement or reload");
+      },
+    } as ExtensionContext;
+    h.internal.latestContext = staleContext;
+
+    await expect(h.internal.deliverReports([report()])).resolves.toBeUndefined();
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(h.internal.sessionLifetime.isActive).toBe(false);
+    expect(
+      h.internal.recentEvents.some((event) => event.kind === "report-delivered"),
+    ).toBe(false);
+    await h.command("reports");
+    expect(h.notify).toHaveBeenLastCalledWith(
+      "No reports delivered in this session yet.",
+      "info",
+    );
     expect(h.custom).not.toHaveBeenCalled();
   });
 

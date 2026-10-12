@@ -9238,12 +9238,8 @@ var ShadowMindRuntime = class {
     const current = reports.filter((report) => report.epoch === this.epoch);
     if (!current.length) return;
     const content = formatReportBatch(current);
-    this.record("report-delivered", {
-      runIds: current.map((report) => report.runId),
-      count: current.length
-    });
-    const idle = this.latestContext?.isIdle() ?? true;
     const delivered = this.sessionLifetime.run(() => {
+      const idle = this.latestContext?.isIdle() ?? true;
       this.pi.sendMessage(
         {
           customType: "shadow-report",
@@ -9259,7 +9255,13 @@ var ShadowMindRuntime = class {
         { triggerTurn: true, deliverAs: idle ? "followUp" : "steer" }
       );
     });
-    if (delivered) this.reports.add(current);
+    if (delivered) {
+      this.record("report-delivered", {
+        runIds: current.map((report) => report.runId),
+        count: current.length
+      });
+      this.reports.add(current);
+    }
   }
   async refresh(ctx) {
     const config = await this.configStore.reload();
