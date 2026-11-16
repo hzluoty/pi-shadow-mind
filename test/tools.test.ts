@@ -1,24 +1,25 @@
-import { describe, expect, it } from "vitest";
-import { buildRunResult, resolveRunThinkingLevel, resolveShadowTools, toolMetrics } from "../src/shadow-runner.js";
+import { describe, expect, it, vi } from "vitest";
+import { resolveModel } from "../src/model-resolution.js";
+import { buildRunResult, resolveRunModel, resolveRunThinkingLevel, resolveShadowTools, toolMetrics } from "../src/shadow-runner.js";
 import { zeroUsage } from "../src/usage.js";
 
-const fullRegistry = new Set(["read", "grep", "find", "ls", "write", "bash", "edit", "custom-tool", "report_to_main"]);
+const fullRegistry = new Set(["read", "ffgrep", "fffind", "write", "bash", "edit", "custom-tool", "report_to_main"]);
 
 describe("resolveShadowTools", () => {
   it("keeps defaults, whitelist additions, and the built-in report tool", () => {
     const { tools, missing } = resolveShadowTools(["write"], fullRegistry);
-    expect(tools).toEqual(["read", "grep", "find", "ls", "write", "report_to_main"]);
+    expect(tools).toEqual(["read", "ffgrep", "fffind", "write", "report_to_main"]);
     expect(missing).toEqual([]);
   });
 
   it("deduplicates overlapping names", () => {
     const { tools } = resolveShadowTools(["read", "write", "read"], fullRegistry);
-    expect(tools).toEqual(["read", "grep", "find", "ls", "write", "report_to_main"]);
+    expect(tools).toEqual(["read", "ffgrep", "fffind", "write", "report_to_main"]);
   });
 
   it("drops whitelist tools missing from the session registry and reports them", () => {
     const { tools, missing } = resolveShadowTools(["nonexistent-tool", "bash"], fullRegistry);
-    expect(tools).toEqual(["read", "grep", "find", "ls", "bash", "report_to_main"]);
+    expect(tools).toEqual(["read", "ffgrep", "fffind", "bash", "report_to_main"]);
     expect(missing).toEqual(["nonexistent-tool"]);
   });
 
@@ -37,7 +38,7 @@ describe("resolveShadowTools", () => {
   it("always keeps report_to_main even when it is not in the available set", () => {
     const { tools, missing } = resolveShadowTools([], new Set(["read"]));
     expect(tools).toEqual(["read", "report_to_main"]);
-    expect(missing).toEqual(["grep", "find", "ls"]);
+    expect(missing).toEqual(["ffgrep", "fffind"]);
   });
 });
 
@@ -164,7 +165,79 @@ describe("resolveRunThinkingLevel", () => {
     expect(resolveRunThinkingLevel(model(undefined), request({ thinkingLevel: "medium" }))).toBe("medium");
   });
 
-  it("fails only when no candidate is supported", () => {
+  it("fails only when no candidate or map entry is supported", () => {
     expect(() => resolveRunThinkingLevel(model({ minimal: null, low: null, medium: null, high: null }), request({ thinkingLevel: "medium" }, "high"))).toThrow(/no supported thinking level/);
+  });
+
+  it("degrades to the highest supported map level when all candidates are unsupported", () => {
+    expect(
+      resolveRunThinkingLevel(
+        model({ low: "low", medium: null, high: "high", xhigh: null, max: "max", minimal: null, off: null }),
+        { shadow: {}, config: { defaultThinkingLevel: "xhigh" }, mainThinkingLevel: "xhigh" } as any,
+      ),
+    ).toBe("max");
+    expect(
+      resolveRunThinkingLevel(
+        model({ low: "low", high: "high", max: null, medium: null, xhigh: null, minimal: null, off: null }),
+        { shadow: {}, config: { defaultThinkingLevel: "xhigh" }, mainThinkingLevel: "xhigh" } as any,
+      ),
+    ).toBe("high");
+  });
+});
+
+describe("resolveModel and resolveRunModel", () => {
+  const glm = { provider: "magpie", id: "autoclaw-cn/zai_glm-5.3-flash" } as any;
+  const deepseek = { provider: "magpie", id: "commandcode-plan/deepseek/deepseek-v4.1-flash" } as any;
+  const noAuth = { provider: "baishan", id: "GLM-5.3-Flash" } as any;
+  const duplicateUnauthed = { provider: "other", id: "shared/model" } as any;
+  const duplicateAuthed = { provider: "magpie", id: "shared/model" } as any;
+  const all = [glm, deepseek, noAuth, duplicateUnauthed, duplicateAuthed];
+  const authed = new Set([glm, deepseek, duplicateAuthed]);
+  const ctx = {
+    modelRegistry: {
+      getAll: () => all,
+      find: (provider: string, id: string) => all.find((m) => m.provider === provider && m.id === id),
+      hasConfiguredAuth: (model: any) => authed.has(model),
+      isUsingOAuth: () => false,
+    },
+  };
+
+  it("resolves bare model ids that contain slashes and prefers authenticated candidates", () => {
+    expect(resolveModel(ctx, glm.id)).toBe(glm);
+    expect(resolveModel(ctx, `${glm.provider}/${glm.id}`)).toBe(glm);
+    expect(resolveModel(ctx, "shared/model")).toBe(duplicateAuthed);
+    expect(resolveModel(ctx, "nope/nope")).toBeUndefined();
+  });
+
+  it("falls back to mainModel with reason when configured shadow model is missing or unauthenticated", () => {
+    const fallbacks: Array<{ requested: string; reason: string; used: string }> = [];
+    const base = {
+      shadow: {},
+      config: { defaultShadowModel: `${glm.provider}/${glm.id}` },
+      mainModel: deepseek,
+      resolveModel: (id: string) => resolveModel(ctx, id),
+      modelAuthOk: (model: any) => ctx.modelRegistry.hasConfiguredAuth(model),
+      onModelFallback: vi.fn((info) => fallbacks.push(info)),
+    } as any;
+
+    expect(resolveRunModel(base)).toBe(glm);
+    expect(fallbacks).toHaveLength(0);
+
+    expect(resolveRunModel({ ...base, config: { defaultShadowModel: "autoclaw-cn/missing" } })).toBe(deepseek);
+    expect(fallbacks.pop()).toEqual({
+      requested: "autoclaw-cn/missing",
+      reason: "not-found",
+      used: `${deepseek.provider}/${deepseek.id}`,
+    });
+
+    expect(resolveRunModel({ ...base, config: { defaultShadowModel: `${noAuth.provider}/${noAuth.id}` } })).toBe(deepseek);
+    expect(fallbacks.pop()).toEqual({
+      requested: `${noAuth.provider}/${noAuth.id}`,
+      reason: "no-auth",
+      used: `${deepseek.provider}/${deepseek.id}`,
+    });
+
+    expect(resolveRunModel({ ...base, shadow: { runWithModel: `${glm.provider}/${glm.id}` }, config: {} })).toBe(glm);
+    expect(resolveRunModel({ ...base, config: {} })).toBe(deepseek);
   });
 });

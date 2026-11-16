@@ -6895,7 +6895,7 @@ import { mkdir as mkdir2, readFile as readFile2, readdir, stat } from "node:fs/p
 import { basename, extname, join as join2 } from "node:path";
 
 // src/types.ts
-var DEFAULT_READ_TOOLS = ["read", "grep", "find", "ls"];
+var DEFAULT_READ_TOOLS = ["read", "ffgrep", "fffind"];
 var SHADOW_TRIGGERS = ["heartbeat", "final_response"];
 
 // src/registry.ts
@@ -7176,8 +7176,34 @@ var FinalResponseBudget = class {
 
 // src/management-tools.ts
 import { Type } from "typebox";
+
+// src/model-resolution.ts
+function resolveModel(ctx, fullId) {
+  const separator = fullId.indexOf("/");
+  const direct = separator <= 0 || separator === fullId.length - 1 ? void 0 : ctx.modelRegistry.find(
+    fullId.slice(0, separator),
+    fullId.slice(separator + 1)
+  );
+  if (direct) return direct;
+  return matchListedModel(ctx, fullId);
+}
+function matchListedModel(ctx, fullId) {
+  const models = ctx.modelRegistry.getAll?.() ?? [];
+  const qualified = models.filter(
+    (model) => `${model.provider}/${model.id}` === fullId
+  );
+  const candidates = qualified.length ? qualified : models.filter((model) => model.id === fullId);
+  if (!candidates.length) return void 0;
+  const authenticated = candidates.find(
+    (model) => ctx.modelRegistry.hasConfiguredAuth(model) || ctx.modelRegistry.isUsingOAuth(model)
+  );
+  return authenticated ?? candidates[0];
+}
+
+// src/management-tools.ts
 var ID = Type.String({ pattern: "^[a-z0-9][a-z0-9_-]*$" });
 var THINKING = Type.Union([
+  Type.Literal("off"),
   Type.Literal("minimal"),
   Type.Literal("low"),
   Type.Literal("medium"),
@@ -7355,6 +7381,11 @@ function configWriteTool(store, getConfig) {
         default_thinking_level: raw.default_thinking_level ?? current.defaultThinkingLevel,
         random_seed: raw.random_seed ?? current.randomSeed
       });
+      if (next.defaultShadowModel && ctx.modelRegistry && !resolveModel(ctx, next.defaultShadowModel)) {
+        throw new Error(
+          `unknown shadow model: ${next.defaultShadowModel}. Pass provider/modelId, e.g. magpie/autoclaw-cn/zai_glm-5.3-flash.`
+        );
+      }
       if (!await confirm(
         ctx,
         "Update Shadow Config",
@@ -7416,7 +7447,8 @@ var ReportBatcher = class {
   add(report) {
     this.reports.push(report);
     if (this.timer) return;
-    this.timer = setTimeout(() => void this.flush(), this.windowMs);
+    this.timer = setTimeout(() => void this.flush().catch(() => {
+    }), this.windowMs);
   }
   async flush() {
     if (this.timer) clearTimeout(this.timer);
@@ -8263,6 +8295,15 @@ function buildRunResult(options) {
 }
 var ShadowRunner = class {
   controllers = /* @__PURE__ */ new Map();
+  /** Abort a shadow session and own the returned promise (AgentSession.abort is async and can reject). */
+  abortSession(session) {
+    if (!session) return;
+    try {
+      void Promise.resolve(session.abort()).catch(() => {
+      });
+    } catch {
+    }
+  }
   async run(request) {
     const started = Date.now();
     const controller = new AbortController();
@@ -8294,9 +8335,8 @@ var ShadowRunner = class {
       timeout = setTimeout(() => {
         state.timedOut = true;
         controller.abort();
-        void boot.session?.abort();
       }, timeoutMs);
-      controller.signal.addEventListener("abort", () => void boot.session?.abort(), { once: true });
+      controller.signal.addEventListener("abort", () => this.abortSession(boot.session), { once: true });
       await boot.session.prompt(buildShadowRequest(trajectory, request.shadow));
       await boot.session.waitForIdle();
       finalReason = runReason(state.timedOut, state.reported, controller.signal.aborted);
@@ -8348,7 +8388,7 @@ var ShadowRunner = class {
         epoch: request.epoch,
         runId: request.runId
       });
-      queueMicrotask(() => void state.session?.abort());
+      queueMicrotask(() => this.abortSession(state.session));
     });
     const tools = [...new Set(request.tools)];
     const created = await createAgentSession({
@@ -8437,18 +8477,45 @@ function resolveRunModel(request) {
   const fullId = request.shadow.runWithModel ?? request.config.defaultShadowModel;
   if (!fullId) return request.mainModel;
   const model = request.resolveModel(fullId);
-  if (!model) throw new Error(`shadow model not found: ${fullId}`);
+  if (!model) return fallbackRunModel(request, fullId, "not-found");
+  if (request.modelAuthOk && !request.modelAuthOk(model)) return fallbackRunModel(request, fullId, "no-auth");
   return model;
+}
+function fallbackRunModel(request, requested, reason) {
+  const fallback = request.mainModel;
+  if (!fallback) throw new Error(`shadow model not found: ${requested}`);
+  request.onModelFallback?.({
+    requested,
+    reason,
+    used: `${fallback.provider}/${fallback.id}`
+  });
+  return fallback;
 }
 function assertShadowModelAuth(model, request) {
   if (request.modelAuthOk && !request.modelAuthOk(model)) {
     throw new Error(`shadow model ${model.provider}/${model.id} has no configured auth`);
   }
 }
+var THINKING_FALLBACK_ORDER = [
+  "xhigh",
+  "max",
+  "high",
+  "medium",
+  "low",
+  "minimal",
+  "off"
+];
 function resolveRunThinkingLevel(model, request) {
   const candidates = [request.shadow.thinkingLevel, request.config.defaultThinkingLevel, request.mainThinkingLevel].filter((level) => level !== void 0);
   for (const level of candidates) {
     if (model.thinkingLevelMap?.[level] !== null) return level;
+  }
+  const map2 = model.thinkingLevelMap;
+  if (map2) {
+    const supported = THINKING_FALLBACK_ORDER.find(
+      (level) => Object.prototype.hasOwnProperty.call(map2, level) && map2[level] !== null
+    );
+    if (supported !== void 0) return supported;
   }
   throw new Error(`no supported thinking level for ${model.provider}/${model.id} (tried: ${candidates.join(", ") || "none"})`);
 }
@@ -8848,7 +8915,7 @@ var ShadowMindRuntime = class {
       this.configStore.current.resultBatchWindowMs,
       (reports) => {
         this.completionReview.invalidate();
-        void this.deliverReports(reports);
+        void this.deliverSafely(reports);
       }
     );
   }
@@ -8870,7 +8937,9 @@ var ShadowMindRuntime = class {
     activeShadowIds: () => new Set([...this.active.values()].map(({ shadow }) => shadow.id)),
     canLaunch: () => !this.batcher.hasPending,
     launch: (pending, review) => this.launchShadow({ ...pending, completionReview: review }),
-    deliver: (reports) => void this.deliverReports(reports),
+    deliver: (reports) => {
+      void this.deliverSafely(reports);
+    },
     onReviewCompleted: (shadowIds) => this.finalResponseBudget.commit(shadowIds)
   });
   recentEvents = [];
@@ -9186,6 +9255,7 @@ var ShadowMindRuntime = class {
       mainModel,
       tools,
       resolveModel: (id) => resolveModel(ctx, id),
+      onModelFallback: (info) => this.record("model-fallback", info),
       modelAuthOk: (model) => ctx.modelRegistry.hasConfiguredAuth(model) || ctx.modelRegistry.isUsingOAuth(model),
       mainThinkingLevel: ctx.thinkingLevel,
       onReport: (report) => {
@@ -9197,12 +9267,15 @@ var ShadowMindRuntime = class {
       this.active.delete(runId);
       this.completionReview.slotAvailable();
       this.completionReview.complete(activeRun2?.completionReview);
-      this.record("run-end", {
-        runId,
-        shadowId: shadow.id,
-        reason: "error",
-        error: error instanceof Error ? error.message : String(error)
-      });
+      try {
+        this.record("run-end", {
+          runId,
+          shadowId: shadow.id,
+          reason: "error",
+          error: error instanceof Error ? error.message : String(error)
+        });
+      } catch {
+      }
     });
   }
   handleRunEnd(runId, shadow, result) {
@@ -9228,6 +9301,18 @@ var ShadowMindRuntime = class {
     void persisted.then(() => {
       if (this.latestContext && this.sessionLifetime.isActive)
         this.updateStatus(this.latestContext);
+    }).catch(() => {
+    });
+  }
+  /** Deliver a report batch and own the returned promise (SessionLifetime.run rethrows non-stale errors). */
+  deliverSafely(reports) {
+    return this.deliverReports(reports).catch((error) => {
+      try {
+        this.record("report-delivery-error", {
+          message: error instanceof Error ? error.message : String(error)
+        });
+      } catch {
+      }
     });
   }
   acceptReport(report) {
@@ -9367,14 +9452,6 @@ var ShadowMindRuntime = class {
     ];
   }
 };
-function resolveModel(ctx, fullId) {
-  const separator = fullId.indexOf("/");
-  if (separator <= 0 || separator === fullId.length - 1) return void 0;
-  return ctx.modelRegistry.find(
-    fullId.slice(0, separator),
-    fullId.slice(separator + 1)
-  );
-}
 function formatNumber(value) {
   return Number(value.toFixed(3)).toString();
 }

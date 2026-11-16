@@ -22,7 +22,8 @@ interface Internals {
   refresh: () => Promise<{ shadows: []; diagnostics: [] }>;
   statusLines: () => string[];
   deliverReports: (reports: ShadowReport[]) => Promise<void>;
-  recentEvents: Array<{ kind: string }>;
+  deliverSafely: (reports: ShadowReport[]) => Promise<void>;
+  recentEvents: Array<{ kind: string; data?: Record<string, unknown> }>;
   handleRunEnd: (id: string, shadow: ShadowDefinition, result: ShadowRunResult) => void;
 }
 const shadow = parseShadowMarkdown("---\nid: reviewer\n---\nReview", "reviewer.md");
@@ -234,5 +235,58 @@ describe("delivered reports through the runtime command and real viewer", () => 
     await h.internal.deliverReports([report()]);
     await h.command("reports");
     expect(h.custom).not.toHaveBeenCalled();
+  });
+
+  it("contains non-stale delivery errors in deliverSafely and records report-delivery-error", async () => {
+    const leaked: unknown[] = [];
+    const listener = (reason: unknown) => leaked.push(reason);
+    process.on("unhandledRejection", listener);
+    try {
+      const h = harness();
+      h.sendMessage.mockImplementationOnce(() => {
+        throw new Error("send failed");
+      });
+      await expect(h.internal.deliverSafely([report()])).resolves.toBeUndefined();
+      expect(h.internal.recentEvents.at(-1)).toMatchObject({
+        kind: "report-delivery-error",
+        data: { message: "send failed" },
+      });
+      expect(leaked).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", listener);
+    }
+  });
+
+  it("owns persisted usage continuation errors in handleRunEnd", async () => {
+    const leaked: unknown[] = [];
+    const listener = (reason: unknown) => leaked.push(reason);
+    process.on("unhandledRejection", listener);
+    try {
+      const h = harness();
+      let resolvePersist!: () => void;
+      (h.internal.usageStore as { add: () => Promise<void> }).add = () =>
+        new Promise<void>((resolve) => {
+          resolvePersist = resolve;
+        });
+      h.internal.active.set("run-1", { shadow, epoch: 0 });
+      h.internal.handleRunEnd("run-1", shadow, {
+        reason: "silent",
+        durationMs: 1,
+        toolNames: [],
+        missingTools: [],
+        toolCalls: 0,
+        toolFailures: 0,
+        toolStats: [],
+        usage: zeroUsage(),
+      });
+      (h.ctx.ui.setStatus as ReturnType<typeof vi.fn>).mockImplementationOnce(() => {
+        throw new Error("status widget failed");
+      });
+      resolvePersist();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(leaked).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", listener);
+    }
   });
 });

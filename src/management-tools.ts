@@ -6,9 +6,11 @@ import type {
 import type { ShadowConfig, ShadowTrigger } from "./types.js";
 import { parseConfig } from "./config.js";
 import { describeShadow, type EntityStore } from "./entity-store.js";
+import { resolveModel } from "./model-resolution.js";
 
 const ID = Type.String({ pattern: "^[a-z0-9][a-z0-9_-]*$" });
 const THINKING = Type.Union([
+  Type.Literal("off"),
   Type.Literal("minimal"),
   Type.Literal("low"),
   Type.Literal("medium"),
@@ -221,6 +223,15 @@ function configWriteTool(
           raw.default_thinking_level ?? current.defaultThinkingLevel,
         random_seed: raw.random_seed ?? current.randomSeed,
       });
+      if (
+        next.defaultShadowModel &&
+        ctx.modelRegistry &&
+        !resolveModel(ctx, next.defaultShadowModel)
+      ) {
+        throw new Error(
+          `unknown shadow model: ${next.defaultShadowModel}. Pass provider/modelId, e.g. magpie/autoclaw-cn/zai_glm-5.3-flash.`,
+        );
+      }
       if (
         !(await confirm(
           ctx,

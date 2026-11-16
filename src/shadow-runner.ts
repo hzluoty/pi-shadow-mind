@@ -60,6 +60,8 @@ export interface ShadowRunRequest {
   resolveModel(fullModelId: string): Model<any> | undefined;
   /** Optional auth check for explicitly configured shadow models (runtime supplies it). */
   modelAuthOk?(model: Model<any>): boolean;
+  /** Optional hook recorded when configured model falls back to mainModel. */
+  onModelFallback?(info: { requested: string; reason: "not-found" | "no-auth"; used: string }): void;
   /** The main session's effective thinking level at activation, used as the final fallback. */
   mainThinkingLevel?: ThinkingLevel;
   onReport(report: ShadowReport): void;
@@ -135,6 +137,16 @@ export function buildRunResult(options: {
 export class ShadowRunner {
   private readonly controllers = new Map<string, { controller: AbortController; session?: ShadowSession }>();
 
+  /** Abort a shadow session and own the returned promise (AgentSession.abort is async and can reject). */
+  private abortSession(session: ShadowSession | undefined): void {
+    if (!session) return;
+    try {
+      void Promise.resolve(session.abort()).catch(() => {});
+    } catch {
+      // Ignore abort-path errors.
+    }
+  }
+
   async run(request: ShadowRunRequest): Promise<ShadowRunResult> {
     const started = Date.now();
     const controller = new AbortController();
@@ -166,9 +178,8 @@ export class ShadowRunner {
       timeout = setTimeout(() => {
         state.timedOut = true;
         controller.abort();
-        void boot.session?.abort();
       }, timeoutMs);
-      controller.signal.addEventListener("abort", () => void boot.session?.abort(), { once: true });
+      controller.signal.addEventListener("abort", () => this.abortSession(boot.session), { once: true });
       await boot.session.prompt(buildShadowRequest(trajectory, request.shadow));
       await boot.session.waitForIdle();
       finalReason = runReason(state.timedOut, state.reported, controller.signal.aborted);
@@ -228,7 +239,7 @@ export class ShadowRunner {
         epoch: request.epoch,
         runId: request.runId,
       });
-      queueMicrotask(() => void state.session?.abort());
+      queueMicrotask(() => this.abortSession(state.session));
     });
     const tools = [...new Set(request.tools)];
     const created = await createAgentSession({
@@ -321,12 +332,28 @@ async function createShadowSessionManager(request: ShadowRunRequest): Promise<Se
   return manager;
 }
 
-function resolveRunModel(request: ShadowRunRequest): Model<any> {
+export function resolveRunModel(request: ShadowRunRequest): Model<any> {
   const fullId = request.shadow.runWithModel ?? request.config.defaultShadowModel;
   if (!fullId) return request.mainModel;
   const model = request.resolveModel(fullId);
-  if (!model) throw new Error(`shadow model not found: ${fullId}`);
+  if (!model) return fallbackRunModel(request, fullId, "not-found");
+  if (request.modelAuthOk && !request.modelAuthOk(model)) return fallbackRunModel(request, fullId, "no-auth");
   return model;
+}
+
+function fallbackRunModel(
+  request: ShadowRunRequest,
+  requested: string,
+  reason: "not-found" | "no-auth",
+): Model<any> {
+  const fallback = request.mainModel;
+  if (!fallback) throw new Error(`shadow model not found: ${requested}`);
+  request.onModelFallback?.({
+    requested,
+    reason,
+    used: `${fallback.provider}/${fallback.id}`,
+  });
+  return fallback;
 }
 
 function assertShadowModelAuth(model: Model<any>, request: ShadowRunRequest): void {
@@ -335,17 +362,36 @@ function assertShadowModelAuth(model: Model<any>, request: ShadowRunRequest): vo
   }
 }
 
+const THINKING_FALLBACK_ORDER: readonly ThinkingLevel[] = [
+  "xhigh",
+  "max",
+  "high",
+  "medium",
+  "low",
+  "minimal",
+  "off",
+];
+
 /**
  * Resolve the thinking level for this run: shadow config → plugin default →
  * the main session's effective level. The first candidate the model supports
  * (per its thinkingLevelMap; null marks unsupported, a missing key or map means
- * provider default, i.e. supported) wins. Fails only when none are supported.
+ * provider default, i.e. supported) wins. If all configured candidates are
+ * explicitly unsupported, degrade to the highest supported level in
+ * thinkingLevelMap; fail only when none are supported.
  */
 export function resolveRunThinkingLevel(model: Model<any>, request: ShadowRunRequest): ThinkingLevel {
   const candidates = [request.shadow.thinkingLevel, request.config.defaultThinkingLevel, request.mainThinkingLevel]
     .filter((level): level is ThinkingLevel => level !== undefined);
   for (const level of candidates) {
     if (model.thinkingLevelMap?.[level] !== null) return level;
+  }
+  const map = model.thinkingLevelMap;
+  if (map) {
+    const supported = THINKING_FALLBACK_ORDER.find(
+      (level) => Object.prototype.hasOwnProperty.call(map, level) && map[level] !== null,
+    );
+    if (supported !== undefined) return supported;
   }
   throw new Error(`no supported thinking level for ${model.provider}/${model.id} (tried: ${candidates.join(", ") || "none"})`);
 }

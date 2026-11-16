@@ -14,4 +14,25 @@ describe("ReportBatcher", () => {
     expect(batcher.hasPending).toBe(false);
     vi.useRealTimers();
   });
+
+  it("contains timer-driven delivery rejections without leaking unhandledRejection", async () => {
+    vi.useFakeTimers();
+    const leaked: unknown[] = [];
+    const listener = (reason: unknown) => leaked.push(reason);
+    process.on("unhandledRejection", listener);
+    try {
+      const batcher = new ReportBatcher(50, async () => {
+        throw new Error("delivery boom");
+      });
+      batcher.add({ shadowId: "a", shadowName: "A", content: "one", epoch: 1, runId: "1" });
+      await vi.advanceTimersByTimeAsync(50);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(batcher.hasPending).toBe(false);
+      expect(leaked).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", listener);
+      vi.useRealTimers();
+    }
+  });
 });

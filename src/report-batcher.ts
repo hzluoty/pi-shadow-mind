@@ -14,7 +14,9 @@ export class ReportBatcher {
   add(report: ShadowReport): void {
     this.reports.push(report);
     if (this.timer) return;
-    this.timer = setTimeout(() => void this.flush(), this.windowMs);
+    // Delivery failures are contained here: a fire-and-forget timer callback
+    // must not leak an unhandled rejection into the host process.
+    this.timer = setTimeout(() => void this.flush().catch(() => {}), this.windowMs);
   }
 
   async flush(): Promise<void> {

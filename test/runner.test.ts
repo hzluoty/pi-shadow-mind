@@ -32,6 +32,7 @@ const mock = vi.hoisted(() => {
     disposed = false;
     behavior: "silent" | "report" | "tools" | "throw" | "hang" = "silent";
     promptError: Error | undefined;
+    abortError: Error | undefined;
     options: any;
     private release?: (err?: Error) => void;
 
@@ -156,9 +157,10 @@ const mock = vi.hoisted(() => {
 
     async waitForIdle(): Promise<void> {}
 
-    abort(): void {
+    abort(): Promise<void> | void {
       this.aborted = true;
       this.release?.(new Error("aborted"));
+      if (this.abortError) return Promise.reject(this.abortError);
     }
 
     dispose(): void {
@@ -194,6 +196,7 @@ const fakeModel = {
 let tmp: string;
 let behavior: InstanceType<typeof mock.FakeSession>["behavior"] = "silent";
 let promptError: Error | undefined;
+let abortError: Error | undefined;
 
 function makeRequest(
   overrides: Partial<ShadowRunRequest> = {},
@@ -243,12 +246,14 @@ describe("ShadowRunner.run integration", () => {
     tmp = mkdtempSync(join(tmpdir(), "shadow-test-"));
     behavior = "silent";
     promptError = undefined;
+    abortError = undefined;
     mock.sessions.length = 0;
     mock.createAgentSession.mockReset();
     mock.createAgentSession.mockImplementation(async (options: any) => {
       const session = new mock.FakeSession(options);
       session.behavior = behavior;
       session.promptError = promptError;
+      session.abortError = abortError;
       mock.sessions.push(session);
       return { session, extensionsResult: {} as any };
     });
@@ -390,6 +395,58 @@ describe("ShadowRunner.run integration", () => {
       requests: 1,
       totalTokens: 8,
       cost: { total: 0.008 },
+    });
+  });
+
+  it("owns rejecting session.abort() promises across report, timeout, and external abort", async () => {
+    const leaked: unknown[] = [];
+    const listener = (reason: unknown) => leaked.push(reason);
+    process.on("unhandledRejection", listener);
+    try {
+      const runner = new ShadowRunner();
+      abortError = new DOMException("This operation was aborted", "AbortError");
+
+      behavior = "report";
+      const reportResult = await runner.run(makeRequest());
+      expect(reportResult.reason).toBe("report");
+
+      behavior = "hang";
+      const timeoutResult = await runner.run(
+        makeRequest({
+          runId: "run-abort-timeout",
+          config: { ...makeRequest().config, defaultShadowTimeoutSeconds: 0.02 },
+        }),
+      );
+      expect(timeoutResult.reason).toBe("timeout");
+
+      const pending = runner.run(makeRequest({ runId: "run-abort-ext" }));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      runner.abort("run-abort-ext");
+      const extResult = await pending;
+      expect(extResult.reason).toBe("aborted");
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(leaked).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", listener);
+    }
+  });
+
+  it("falls back to mainModel inside run() when configured model cannot be resolved", async () => {
+    const runner = new ShadowRunner();
+    const onModelFallback = vi.fn();
+    const result = await runner.run(
+      makeRequest({
+        config: { ...makeRequest().config, defaultShadowModel: "missing/model" },
+        resolveModel: () => undefined,
+        onModelFallback,
+      }),
+    );
+    expect(result.reason).toBe("silent");
+    expect(onModelFallback).toHaveBeenCalledWith({
+      requested: "missing/model",
+      reason: "not-found",
+      used: `${fakeModel.provider}/${fakeModel.id}`,
     });
   });
 });

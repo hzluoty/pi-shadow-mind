@@ -15,6 +15,7 @@ import { ConfigStore } from "./config.js";
 import { EntityStore } from "./entity-store.js";
 import { FinalResponseBudget } from "./final-response-budget.js";
 import { registerManagementTools } from "./management-tools.js";
+import { resolveModel } from "./model-resolution.js";
 import { ShadowRegistry } from "./registry.js";
 import { ReportBatcher, formatReportBatch } from "./report-batcher.js";
 import { ReportBrowser } from "./report-browser.js";
@@ -95,7 +96,9 @@ export class ShadowMindRuntime {
     canLaunch: () => !this.batcher.hasPending,
     launch: (pending, review) =>
       this.launchShadow({ ...pending, completionReview: review }),
-    deliver: (reports) => void this.deliverReports(reports),
+    deliver: (reports) => {
+      void this.deliverSafely(reports);
+    },
     onReviewCompleted: (shadowIds) =>
       this.finalResponseBudget.commit(shadowIds),
   });
@@ -124,7 +127,7 @@ export class ShadowMindRuntime {
       this.configStore.current.resultBatchWindowMs,
       (reports) => {
         this.completionReview.invalidate();
-        void this.deliverReports(reports);
+        void this.deliverSafely(reports);
       },
     );
   }
@@ -467,6 +470,7 @@ export class ShadowMindRuntime {
         mainModel,
         tools,
         resolveModel: (id) => resolveModel(ctx, id),
+        onModelFallback: (info) => this.record("model-fallback", info),
         modelAuthOk: (model) =>
           ctx.modelRegistry.hasConfiguredAuth(model) ||
           ctx.modelRegistry.isUsingOAuth(model),
@@ -482,12 +486,16 @@ export class ShadowMindRuntime {
         this.active.delete(runId);
         this.completionReview.slotAvailable();
         this.completionReview.complete(activeRun?.completionReview);
-        this.record("run-end", {
-          runId,
-          shadowId: shadow.id,
-          reason: "error",
-          error: error instanceof Error ? error.message : String(error),
-        });
+        try {
+          this.record("run-end", {
+            runId,
+            shadowId: shadow.id,
+            reason: "error",
+            error: error instanceof Error ? error.message : String(error),
+          });
+        } catch {
+          // Error-path logging must never escalate into an unhandled rejection.
+        }
       });
   }
 
@@ -515,9 +523,24 @@ export class ShadowMindRuntime {
     if (this.latestContext && this.sessionLifetime.isActive)
       this.updateStatus(this.latestContext);
     this.completionReview.complete(activeRun.completionReview);
-    void persisted.then(() => {
-      if (this.latestContext && this.sessionLifetime.isActive)
-        this.updateStatus(this.latestContext);
+    void persisted
+      .then(() => {
+        if (this.latestContext && this.sessionLifetime.isActive)
+          this.updateStatus(this.latestContext);
+      })
+      .catch(() => {});
+  }
+
+  /** Deliver a report batch and own the returned promise (SessionLifetime.run rethrows non-stale errors). */
+  private deliverSafely(reports: readonly ShadowReport[]): Promise<void> {
+    return this.deliverReports(reports).catch((error) => {
+      try {
+        this.record("report-delivery-error", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      } catch {
+        // Error-path logging must never escalate into an unhandled rejection.
+      }
     });
   }
 
@@ -691,15 +714,6 @@ export class ShadowMindRuntime {
       "Shortcut: Alt+S toggle · Commands: /shadow toggle | pause | resume | status | hide | reports",
     ];
   }
-}
-
-function resolveModel(ctx: ExtensionContext, fullId: string) {
-  const separator = fullId.indexOf("/");
-  if (separator <= 0 || separator === fullId.length - 1) return undefined;
-  return ctx.modelRegistry.find(
-    fullId.slice(0, separator),
-    fullId.slice(separator + 1),
-  );
 }
 
 function formatNumber(value: number): string {
