@@ -1,24 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sanitizeTrajectory, serializeTrajectory } from "../src/trajectory.js";
-
-describe("sanitizeTrajectory", () => {
-  it("removes thinking and summarizes tool results while retaining calls", () => {
-    const result = sanitizeTrajectory([
-      { role: "assistant", content: [
-        { type: "thinking", thinking: "secret" },
-        { type: "text", text: "I will inspect it." },
-        { type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } },
-      ] },
-      { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "one\ntwo" }], details: { huge: true }, isError: false },
-      { role: "custom", customType: "other-plugin", content: "hidden" },
-      { role: "custom", customType: "shadow-report", content: "previous feedback" },
-    ]);
-    expect((result[0].content as Array<{ type: string }>).map(({ type }) => type)).toEqual(["text", "toolCall"]);
-    expect(result[1].content).toEqual([{ type: "text", text: "2 read · one" }]);
-    expect(result[1].details).toBeUndefined();
-    expect(result).toHaveLength(3);
-  });
-});
+import { serializeTrajectory } from "../src/trajectory.js";
 
 describe("serializeTrajectory", () => {
   it("retains native compaction and branch summary payloads", () => {
@@ -48,5 +29,14 @@ describe("serializeTrajectory", () => {
     expect(result).toContain('TOOL: read({"path":"a.ts"}) · 2 read · one');
     expect(result).toContain("SHADOW FEEDBACK: previous feedback");
     expect(result).not.toContain("secret");
+    expect(result).not.toContain("TOOL RESULT:");
+  });
+
+  it("emits TOOL RESULT fallback for orphaned toolResult messages with string toolCallIds", () => {
+    const result = serializeTrajectory([
+      { role: "user", content: "Continue after compaction" },
+      { role: "toolResult", toolCallId: "orphan-call-1", toolName: "read", content: [{ type: "text", text: "line1\nline2" }], isError: false },
+    ]);
+    expect(result).toContain("TOOL RESULT: 2 read · line1");
   });
 });

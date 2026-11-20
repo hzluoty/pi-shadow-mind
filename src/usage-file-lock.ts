@@ -9,12 +9,16 @@ export interface UsageFileLockTiming {
   retryMs?: number;
   staleMs?: number;
   heartbeatMs?: number;
+  acquireTimeoutMs?: number;
+  releaseTimeoutMs?: number;
 }
 
 interface ResolvedUsageFileLockTiming {
   retryMs: number;
   staleMs: number;
   heartbeatMs: number;
+  acquireTimeoutMs: number;
+  releaseTimeoutMs: number;
 }
 
 interface UsageLockOwner {
@@ -36,12 +40,16 @@ export async function acquireUsageFileLock(
   const resolved = resolveTiming(timing);
   const lockPath = `${usagePath}.lock`;
   const owner = { token: randomUUID(), pid: process.pid };
+  const deadline = Date.now() + resolved.acquireTimeoutMs;
   while (true) {
     try {
       await mkdir(lockPath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       await recoverStaleUsageLock(lockPath, resolved);
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out acquiring usage file lock: ${lockPath}`);
+      }
       await delay(resolved.retryMs);
       continue;
     }
@@ -94,6 +102,7 @@ async function recoverStaleUsageLock(
 
   const operationPath = join(lockPath, USAGE_LOCK_OPERATION_DIRECTORY);
   if (!await claimUsageLockOperation(operationPath, timing)) return;
+  let renamed = false;
   try {
     const current = await readUsageLockState(lockPath);
     if (!current
@@ -103,13 +112,17 @@ async function recoverStaleUsageLock(
     const abandonedPath = `${lockPath}.${randomUUID()}.stale`;
     try {
       await rename(lockPath, abandonedPath);
+      renamed = true;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || isTransientRenameError(code)) return;
       throw error;
     }
     await rm(abandonedPath, { recursive: true, force: true });
   } finally {
-    await rm(operationPath, { recursive: true, force: true }).catch(() => undefined);
+    if (!renamed) {
+      await rm(operationPath, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }
 
@@ -119,13 +132,18 @@ async function releaseUsageLock(
   timing: ResolvedUsageFileLockTiming,
 ): Promise<void> {
   const operationPath = join(lockPath, USAGE_LOCK_OPERATION_DIRECTORY);
+  const deadline = Date.now() + timing.releaseTimeoutMs;
   while (true) {
     const observed = await readUsageLockState(lockPath);
     if (!observed || observed.owner?.token !== token) return;
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out releasing usage file lock: ${lockPath}`);
+    }
     if (!await claimUsageLockOperation(operationPath, timing)) {
       await delay(timing.retryMs);
       continue;
     }
+    let renamed = false;
     try {
       const current = await readUsageLockState(lockPath);
       if (!current || current.owner?.token !== token) return;
@@ -133,14 +151,22 @@ async function releaseUsageLock(
       const releasedPath = `${lockPath}.${token}.released`;
       try {
         await rename(lockPath, releasedPath);
+        renamed = true;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") continue;
+        if (isTransientRenameError(code)) {
+          await delay(timing.retryMs);
+          continue;
+        }
         throw error;
       }
       await rm(releasedPath, { recursive: true, force: true });
       return;
     } finally {
-      await rm(operationPath, { recursive: true, force: true }).catch(() => undefined);
+      if (!renamed) {
+        await rm(operationPath, { recursive: true, force: true }).catch(() => undefined);
+      }
     }
   }
 }
@@ -172,7 +198,8 @@ async function claimUsageLockOperation(
   try {
     await rename(operationPath, abandonedPath);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || isTransientRenameError(code)) return false;
     throw error;
   }
   await rm(abandonedPath, { recursive: true, force: true });
@@ -243,11 +270,17 @@ function sameUsageLock(left: UsageLockState, right: UsageLockState): boolean {
     : left.owner === right.owner && left.dev === right.dev && left.ino === right.ino;
 }
 
+function isTransientRenameError(code: string | undefined): boolean {
+  return code === "EPERM" || code === "EBUSY" || code === "EACCES";
+}
+
 function resolveTiming(timing: UsageFileLockTiming): ResolvedUsageFileLockTiming {
   return {
     retryMs: timing.retryMs ?? 25,
     staleMs: timing.staleMs ?? 30_000,
     heartbeatMs: timing.heartbeatMs ?? 10_000,
+    acquireTimeoutMs: timing.acquireTimeoutMs ?? 10_000,
+    releaseTimeoutMs: timing.releaseTimeoutMs ?? 10_000,
   };
 }
 

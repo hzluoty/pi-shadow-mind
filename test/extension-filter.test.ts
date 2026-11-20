@@ -1,8 +1,8 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { createExtensionExcluder, isSelfExtension } from "../src/extension-filter.js";
+import { createExtensionExcluder, extensionIdentifiers, isSelfExtension } from "../src/extension-filter.js";
 
 /**
  * A real directory tree: the filter reads `package.json` from disk, because
@@ -105,6 +105,30 @@ describe("createExtensionExcluder", () => {
       looseFile,
     ]);
   });
+
+  it("treats virtual builtin and inline extension paths without resolving against cwd package", () => {
+    // Current repo is "pi-shadow-mind"; builtin:foo must never pick up repo package name.
+    expect(extensionIdentifiers("builtin:foo")).toEqual(new Set(["builtin:foo", "foo"]));
+    expect(createExtensionExcluder(["pi-shadow-mind"])("builtin:foo")).toBe(false);
+    expect(createExtensionExcluder(["pi-shadow-mind"])("<inline:test>")).toBe(false);
+    expect(createExtensionExcluder(["foo"])("builtin:foo")).toBe(true);
+    expect(createExtensionExcluder(["builtin:foo"])("builtin:foo")).toBe(true);
+  });
+
+  it("matches symlinked paths and home-prefixed paths", () => {
+    const linkFile = join(root, "linked-local.ts");
+    try {
+      symlinkSync(localFile, linkFile);
+    } catch {
+      return;
+    }
+    expect(createExtensionExcluder([localFile])(linkFile)).toBe(true);
+    expect(createExtensionExcluder([linkFile])(localFile)).toBe(true);
+
+    const homeRelative = `~\\.pi\\agent\\ext-test.ts`.replace("~\\", process.platform === "win32" ? "~\\" : "~/");
+    const homeTarget = join(homedir(), ".pi", "agent", "ext-test.ts");
+    expect(createExtensionExcluder([homeRelative])(homeTarget)).toBe(true);
+  });
 });
 
 describe("isSelfExtension", () => {
@@ -115,6 +139,24 @@ describe("isSelfExtension", () => {
     expect(isSelfExtension(resolve(sourceDirectory, "index.ts"))).toBe(true);
     expect(isSelfExtension(resolve(sourceDirectory, "index.js"))).toBe(true);
     expect(isSelfExtension(resolve(sourceDirectory, "./nested/../index.js"))).toBe(true);
+    if (process.platform === "win32") {
+      const flipped = resolve(sourceDirectory, "index.ts").replace(/^[A-Za-z]:/, (d) =>
+        d === d.toUpperCase() ? d.toLowerCase() : d.toUpperCase(),
+      );
+      expect(isSelfExtension(flipped)).toBe(true);
+    }
+  });
+
+  it("matches this plugin through symlinks and ignores virtual paths", () => {
+    expect(isSelfExtension("builtin:pi-shadow-mind")).toBe(false);
+    expect(isSelfExtension("<inline:pi-shadow-mind>")).toBe(false);
+    const linkEntry = join(root, "self-link.ts");
+    try {
+      symlinkSync(resolve(sourceDirectory, "index.ts"), linkEntry);
+    } catch {
+      return;
+    }
+    expect(isSelfExtension(linkEntry)).toBe(true);
   });
 
   it("does not match other extensions", () => {

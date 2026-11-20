@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ShadowMindRuntime } from "../src/runtime.js";
 import { parseShadowMarkdown } from "../src/registry.js";
 import type { ShadowRunResult } from "../src/shadow-runner.js";
+import type { StatusPresenter, StatusSnapshot } from "../src/status-presenter.js";
 import type { ShadowDefinition, ShadowReport } from "../src/types.js";
 import { zeroUsage } from "../src/usage.js";
 
@@ -11,7 +12,8 @@ type Handler = (event: unknown, ctx: ExtensionContext) => Promise<void>;
 type Command = (args: string, ctx: ExtensionContext) => Promise<void>;
 interface Internals {
   active: Map<string, { shadow: ShadowDefinition; epoch: number }>;
-  panelVisible: boolean;
+  presenter: StatusPresenter;
+  statusSnapshot: () => StatusSnapshot;
   configStore: { initialize: () => Promise<void> };
   registry: { initialize: () => Promise<void> };
   usageStore: { add: () => Promise<void>; initialize: () => Promise<void>; flush: () => Promise<void> };
@@ -20,10 +22,8 @@ interface Internals {
   registerUi: () => void;
   registerEvents: () => void;
   refresh: () => Promise<{ shadows: []; diagnostics: [] }>;
-  statusLines: () => string[];
   deliverReports: (reports: ShadowReport[]) => Promise<void>;
   deliverSafely: (reports: ShadowReport[]) => Promise<void>;
-  recentEvents: Array<{ kind: string; data?: Record<string, unknown> }>;
   handleRunEnd: (id: string, shadow: ShadowDefinition, result: ShadowRunResult) => void;
 }
 const shadow = parseShadowMarkdown("---\nid: reviewer\n---\nReview", "reviewer.md");
@@ -86,8 +86,8 @@ describe("delivered reports through the runtime command and real viewer", () => 
     const pending = h.command("reports");
     expect(h.custom).toHaveBeenCalledOnce();
     expect(h.render().join("\n")).toContain("REPORT_BODY");
-    expect(h.internal.panelVisible).toBe(false);
-    expect(h.internal.statusLines().join("\n")).not.toContain("REPORT_BODY");
+    expect(h.internal.presenter.panelVisible).toBe(false);
+    expect(h.internal.presenter.statusLines(h.internal.statusSnapshot()).join("\n")).not.toContain("REPORT_BODY");
     expect(h.custom).toHaveBeenCalledWith(expect.any(Function), {
       overlay: true, overlayOptions: { width: "90%", maxHeight: "80%", margin: 1 },
     });
@@ -95,7 +95,7 @@ describe("delivered reports through the runtime command and real viewer", () => 
       customType: "shadow-report", content: expect.stringContaining("REPORT_BODY"),
     }), { triggerTurn: true, deliverAs: "followUp" });
     expect(
-      h.internal.recentEvents.filter((event) => event.kind === "report-delivered"),
+      h.internal.presenter.recentEvents.filter((event) => event.kind === "report-delivered"),
     ).toHaveLength(1);
     h.input("\x1b");
     await pending;
@@ -193,7 +193,7 @@ describe("delivered reports through the runtime command and real viewer", () => 
     expect(h.sendMessage).not.toHaveBeenCalled();
     expect(h.internal.sessionLifetime.isActive).toBe(false);
     expect(
-      h.internal.recentEvents.some((event) => event.kind === "report-delivered"),
+      h.internal.presenter.recentEvents.some((event) => event.kind === "report-delivered"),
     ).toBe(false);
     await h.command("reports");
     expect(h.notify).toHaveBeenLastCalledWith(
@@ -247,7 +247,7 @@ describe("delivered reports through the runtime command and real viewer", () => 
         throw new Error("send failed");
       });
       await expect(h.internal.deliverSafely([report()])).resolves.toBeUndefined();
-      expect(h.internal.recentEvents.at(-1)).toMatchObject({
+      expect(h.internal.presenter.recentEvents.at(-1)).toMatchObject({
         kind: "report-delivery-error",
         data: { message: "send failed" },
       });

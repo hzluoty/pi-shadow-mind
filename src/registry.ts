@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, stat } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, stat } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import YAML from "yaml";
@@ -10,22 +10,32 @@ import {
   type ShadowTrigger,
 } from "./types.js";
 import {
+  SHADOW_ID_PATTERN,
   cleanStringArray,
-  inRange,
-  isFiniteNumber,
-  isNonEmptyString,
-  isStringArray,
   isThinkingLevel,
+  numberInRange,
+  optionalNonEmptyString,
+  optionalNonNegativeInteger,
+  optionalPositiveNumber,
+  stringWithFallback,
 } from "./validation.js";
 
-const ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+interface FileFingerprint {
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+  size: bigint;
+  ino: bigint;
+}
+
+interface CacheEntry {
+  fingerprint: FileFingerprint;
+  shadow?: ShadowDefinition;
+  error?: string;
+}
 
 export class ShadowRegistry {
   readonly directory: string;
-  private readonly cache = new Map<
-    string,
-    { mtimeMs: number; shadow?: ShadowDefinition; error?: string }
-  >();
+  private readonly cache = new Map<string, CacheEntry>();
 
   constructor(agentDir: string) {
     this.directory = join(agentDir, "shadow-minds");
@@ -33,6 +43,11 @@ export class ShadowRegistry {
 
   async initialize(): Promise<void> {
     await mkdir(this.directory, { recursive: true });
+  }
+
+  invalidate(filePath?: string): void {
+    if (filePath) this.cache.delete(filePath);
+    else this.cache.clear();
   }
 
   async load(): Promise<RegistrySnapshot> {
@@ -45,28 +60,50 @@ export class ShadowRegistry {
     const seen = new Set<string>();
     for (const name of names) {
       const filePath = join(this.directory, name);
-      seen.add(filePath);
-      const fileStat = await stat(filePath);
-      const cached = this.cache.get(filePath);
-      if (cached && cached.mtimeMs === fileStat.mtimeMs) {
-        // Unchanged since last load: reuse the cached parse result.
-        if (cached.shadow) shadows.push(cached.shadow);
-        if (cached.error) diagnostics.push({ filePath, message: cached.error });
-        continue;
-      }
+      let fingerprint: FileFingerprint | undefined;
       try {
+        const fileStat = await stat(filePath, { bigint: true });
+        if (!fileStat.isFile()) {
+          seen.add(filePath);
+          const message = "not a regular file";
+          this.cache.delete(filePath);
+          diagnostics.push({ filePath, message });
+          continue;
+        }
+        fingerprint = toFingerprint(fileStat);
+        seen.add(filePath);
+        const cached = this.cache.get(filePath);
+        if (cached && sameFingerprint(cached.fingerprint, fingerprint)) {
+          // Unchanged since last load: reuse the cached parse result.
+          if (cached.shadow) shadows.push(cached.shadow);
+          if (cached.error) diagnostics.push({ filePath, message: cached.error });
+          continue;
+        }
         const definition = parseShadowMarkdown(
           await readFile(filePath, "utf8"),
           filePath,
         );
         this.cache.set(filePath, {
-          mtimeMs: fileStat.mtimeMs,
+          fingerprint,
           shadow: definition,
         });
         shadows.push(definition);
       } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          this.cache.delete(filePath);
+          if (await isBrokenSymlink(filePath)) {
+            seen.add(filePath);
+            diagnostics.push({ filePath, message: "broken symlink" });
+          }
+          continue;
+        }
+        seen.add(filePath);
         const message = error instanceof Error ? error.message : String(error);
-        this.cache.set(filePath, { mtimeMs: fileStat.mtimeMs, error: message });
+        if (fingerprint) {
+          this.cache.set(filePath, { fingerprint, error: message });
+        } else {
+          this.cache.delete(filePath);
+        }
         diagnostics.push({ filePath, message });
       }
     }
@@ -104,18 +141,20 @@ export function parseShadowMarkdown(
     throw new Error("frontmatter must be an object");
   const value = meta as Record<string, unknown>;
   const fallbackId = basename(filePath, extname(filePath));
-  const id = stringValue(value.id, fallbackId, "id");
-  if (!ID_PATTERN.test(id))
+  const id = stringWithFallback(value.id, fallbackId, "id");
+  if (!SHADOW_ID_PATTERN.test(id))
     throw new Error("id must match [a-z0-9][a-z0-9_-]*");
   const prompt = match[2].trim();
   if (!prompt) throw new Error("shadow prompt body is empty");
   return {
     id,
-    name: stringValue(value.name, id, "name"),
+    name: stringWithFallback(value.name, id, "name"),
     enabled: booleanValue(value.enabled, true, "enabled"),
     debug: booleanValue(value.debug, false, "debug"),
-    activationProbability: probabilityValue(
+    activationProbability: numberInRange(
       value.activation_probability,
+      0,
+      1,
       0.3,
       "activation_probability",
     ),
@@ -125,7 +164,7 @@ export function parseShadowMarkdown(
       ["*"],
       "active_for_models",
     ),
-    runWithModel: optionalString(value.run_with_model, "run_with_model"),
+    runWithModel: optionalNonEmptyString(value.run_with_model, "run_with_model"),
     thinkingLevel: optionalThinking(value.thinking_level),
     timeoutSeconds: optionalPositiveNumber(
       value.timeout_seconds,
@@ -146,15 +185,37 @@ export function parseShadowMarkdown(
   };
 }
 
-function stringValue(value: unknown, fallback: string, name: string): string {
-  if (value === undefined) return fallback;
-  if (!isNonEmptyString(value))
-    throw new Error(`${name} must be a non-empty string`);
-  return value.trim();
+function toFingerprint(fileStat: {
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+  size: bigint;
+  ino: bigint;
+}): FileFingerprint {
+  return {
+    mtimeNs: fileStat.mtimeNs,
+    ctimeNs: fileStat.ctimeNs,
+    size: fileStat.size,
+    ino: fileStat.ino,
+  };
 }
-function optionalString(value: unknown, name: string): string | undefined {
-  return value === undefined ? undefined : stringValue(value, "", name);
+
+function sameFingerprint(left: FileFingerprint, right: FileFingerprint): boolean {
+  return (
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs &&
+    left.size === right.size &&
+    left.ino === right.ino
+  );
 }
+
+async function isBrokenSymlink(filePath: string): Promise<boolean> {
+  try {
+    return (await lstat(filePath)).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 function booleanValue(
   value: unknown,
   fallback: boolean,
@@ -162,34 +223,6 @@ function booleanValue(
 ): boolean {
   if (value === undefined) return fallback;
   if (typeof value !== "boolean") throw new Error(`${name} must be boolean`);
-  return value;
-}
-function probabilityValue(
-  value: unknown,
-  fallback: number,
-  name: string,
-): number {
-  if (value === undefined) return fallback;
-  if (!isFiniteNumber(value) || !inRange(value, 0, 1))
-    throw new Error(`${name} must be between 0 and 1`);
-  return value;
-}
-function optionalPositiveNumber(
-  value: unknown,
-  name: string,
-): number | undefined {
-  if (value === undefined) return undefined;
-  if (!isFiniteNumber(value) || value <= 0)
-    throw new Error(`${name} must be positive`);
-  return value;
-}
-function optionalNonNegativeInteger(
-  value: unknown,
-  name: string,
-): number | undefined {
-  if (value === undefined) return undefined;
-  if (!isFiniteNumber(value) || !Number.isInteger(value) || value < 0)
-    throw new Error(`${name} must be a non-negative integer`);
   return value;
 }
 function triggerArray(

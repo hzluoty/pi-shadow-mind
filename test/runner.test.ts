@@ -30,9 +30,10 @@ const mock = vi.hoisted(() => {
     sessionFile = "/tmp/fake/session.jsonl";
     aborted = false;
     disposed = false;
-    behavior: "silent" | "report" | "tools" | "throw" | "hang" = "silent";
+    behavior: "silent" | "report" | "blank-report" | "tools" | "throw" | "hang" = "silent";
     promptError: Error | undefined;
     abortError: Error | undefined;
+    lastReportResult: any;
     options: any;
     private release?: (err?: Error) => void;
 
@@ -90,14 +91,14 @@ const mock = vi.hoisted(() => {
         });
         throw this.promptError ?? new Error("prompt failed");
       }
-      if (this.behavior === "report") {
+      if (this.behavior === "report" || this.behavior === "blank-report") {
         // Simulate the model calling the (real) built-in report_to_main tool.
         const reportTool = this.options.customTools?.find(
           (tool: any) => tool.name === "report_to_main",
         );
-        await reportTool.execute(
+        this.lastReportResult = await reportTool.execute(
           "call-1",
-          { content: "found a smell" },
+          { content: this.behavior === "blank-report" ? "   \n  " : "found a smell" },
           undefined,
           undefined,
           {} as any,
@@ -448,5 +449,44 @@ describe("ShadowRunner.run integration", () => {
       reason: "not-found",
       used: `${fakeModel.provider}/${fakeModel.id}`,
     });
+  });
+
+  it("rejects blank report_to_main payloads without delivering or aborting the run", async () => {
+    const runner = new ShadowRunner();
+    const onReport = vi.fn();
+    behavior = "blank-report";
+    const result = await runner.run(makeRequest({ onReport }));
+    const session = mock.sessions[0];
+    expect(result.reason).toBe("silent");
+    expect(onReport).not.toHaveBeenCalled();
+    expect(session.aborted).toBe(false);
+    expect(session.lastReportResult).toMatchObject({ isError: true });
+  });
+
+  it("times out during a hung bootstrap and disposes the late session", async () => {
+    let releaseCreate!: () => void;
+    mock.createAgentSession.mockImplementationOnce(async (options: any) => {
+      await new Promise<void>((resolve) => {
+        releaseCreate = resolve;
+      });
+      const session = new mock.FakeSession(options);
+      mock.sessions.push(session);
+      return { session, extensionsResult: {} as any };
+    });
+
+    const runner = new ShadowRunner();
+    const result = await runner.run(
+      makeRequest({
+        runId: "run-boot-timeout",
+        config: { ...makeRequest().config, defaultShadowTimeoutSeconds: 0.03 },
+      }),
+    );
+    expect(result.reason).toBe("timeout");
+    expect(mock.sessions).toHaveLength(0);
+
+    releaseCreate();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mock.sessions).toHaveLength(1);
+    expect(mock.sessions[0].disposed).toBe(true);
   });
 });

@@ -153,8 +153,54 @@ function cleanStringArray(value, fallback, name) {
     throw new Error(`${name} must be an array of non-empty strings`);
   return [...new Set(value.map((item) => item.trim()))];
 }
+var SHADOW_ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
 function isThinkingLevel(value) {
   return typeof value === "string" && THINKING_LEVELS.has(value);
+}
+function numberInRange(value, min, max, fallback, name) {
+  if (value === void 0) return fallback;
+  if (!isFiniteNumber(value) || !inRange(value, min, max)) {
+    throw new Error(`${name} must be between ${min} and ${max}`);
+  }
+  return value;
+}
+function optionalPositiveNumber(value, name) {
+  if (value === void 0) return void 0;
+  if (!isFiniteNumber(value) || value <= 0) {
+    throw new Error(`${name} must be positive`);
+  }
+  return value;
+}
+function positiveNumber(value, fallback, name) {
+  return optionalPositiveNumber(value, name) ?? fallback;
+}
+function positiveInteger(value, fallback, name) {
+  const parsed = positiveNumber(value, fallback, name);
+  if (!Number.isInteger(parsed)) {
+    throw new Error(`${name} must be an integer`);
+  }
+  return parsed;
+}
+function optionalNonNegativeInteger(value, name) {
+  if (value === void 0) return void 0;
+  if (!isFiniteNumber(value) || !Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return value;
+}
+function nonNegativeInteger(value, fallback, name) {
+  return optionalNonNegativeInteger(value, name) ?? fallback;
+}
+function stringWithFallback(value, fallback, name) {
+  if (value === void 0) return fallback;
+  if (!isNonEmptyString(value)) {
+    throw new Error(`${name} must be a non-empty string`);
+  }
+  return value.trim();
+}
+function optionalNonEmptyString(value, name) {
+  if (value === void 0) return void 0;
+  return stringWithFallback(value, "", name);
 }
 
 // src/config.ts
@@ -230,7 +276,14 @@ var ConfigStore = class {
       await readFile(this.configPath, "utf8");
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
-      await writeFile(this.configPath, serializeConfig(DEFAULT_CONFIG), "utf8");
+      try {
+        await writeFile(this.configPath, serializeConfig(DEFAULT_CONFIG), {
+          encoding: "utf8",
+          flag: "wx"
+        });
+      } catch (writeError) {
+        if (writeError.code !== "EEXIST") throw writeError;
+      }
     }
     await this.reload();
   }
@@ -251,31 +304,6 @@ var ConfigStore = class {
     return this.lastError;
   }
 };
-function numberInRange(value, min, max, fallback, name) {
-  if (value === void 0) return fallback;
-  if (!isFiniteNumber(value) || !inRange(value, min, max)) throw new Error(`${name} must be between ${min} and ${max}`);
-  return value;
-}
-function positiveNumber(value, fallback, name) {
-  if (value === void 0) return fallback;
-  if (!isFiniteNumber(value) || value <= 0) throw new Error(`${name} must be positive`);
-  return value;
-}
-function positiveInteger(value, fallback, name) {
-  const parsed = positiveNumber(value, fallback, name);
-  if (!Number.isInteger(parsed)) throw new Error(`${name} must be an integer`);
-  return parsed;
-}
-function nonNegativeInteger(value, fallback, name) {
-  if (value === void 0) return fallback;
-  if (!isFiniteNumber(value) || !Number.isInteger(value) || value < 0) throw new Error(`${name} must be a non-negative integer`);
-  return value;
-}
-function optionalNonEmptyString(value, name) {
-  if (value === void 0) return void 0;
-  if (!isNonEmptyString(value)) throw new Error(`${name} must be a non-empty string`);
-  return value.trim();
-}
 function optionalSeed(value) {
   if (value === void 0) return void 0;
   if (!isFiniteNumber(value) || !Number.isInteger(value) || value < 0 || value > 4294967295) {
@@ -285,7 +313,7 @@ function optionalSeed(value) {
 }
 
 // src/entity-store.ts
-import { readFile as readFile3, unlink, writeFile as writeFile2 } from "node:fs/promises";
+import { access, readFile as readFile3, unlink, writeFile as writeFile2 } from "node:fs/promises";
 import { basename as basename2, join as join3 } from "node:path";
 
 // node_modules/yaml/browser/dist/index.js
@@ -6891,15 +6919,14 @@ function stringify3(value, replacer, options) {
 var browser_default = dist_exports;
 
 // src/registry.ts
-import { mkdir as mkdir2, readFile as readFile2, readdir, stat } from "node:fs/promises";
+import { lstat, mkdir as mkdir2, readFile as readFile2, readdir, stat } from "node:fs/promises";
 import { basename, extname, join as join2 } from "node:path";
 
 // src/types.ts
-var DEFAULT_READ_TOOLS = ["read", "ffgrep", "fffind"];
+var DEFAULT_READ_TOOLS = ["read", "grep", "find", "ls"];
 var SHADOW_TRIGGERS = ["heartbeat", "final_response"];
 
 // src/registry.ts
-var ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
 var ShadowRegistry = class {
   directory;
   cache = /* @__PURE__ */ new Map();
@@ -6909,6 +6936,10 @@ var ShadowRegistry = class {
   async initialize() {
     await mkdir2(this.directory, { recursive: true });
   }
+  invalidate(filePath) {
+    if (filePath) this.cache.delete(filePath);
+    else this.cache.clear();
+  }
   async load() {
     await this.initialize();
     const names = (await readdir(this.directory)).filter((name) => extname(name).toLowerCase() === ".md").sort();
@@ -6917,27 +6948,49 @@ var ShadowRegistry = class {
     const seen = /* @__PURE__ */ new Set();
     for (const name of names) {
       const filePath = join2(this.directory, name);
-      seen.add(filePath);
-      const fileStat = await stat(filePath);
-      const cached = this.cache.get(filePath);
-      if (cached && cached.mtimeMs === fileStat.mtimeMs) {
-        if (cached.shadow) shadows.push(cached.shadow);
-        if (cached.error) diagnostics.push({ filePath, message: cached.error });
-        continue;
-      }
+      let fingerprint;
       try {
+        const fileStat = await stat(filePath, { bigint: true });
+        if (!fileStat.isFile()) {
+          seen.add(filePath);
+          const message = "not a regular file";
+          this.cache.delete(filePath);
+          diagnostics.push({ filePath, message });
+          continue;
+        }
+        fingerprint = toFingerprint(fileStat);
+        seen.add(filePath);
+        const cached = this.cache.get(filePath);
+        if (cached && sameFingerprint(cached.fingerprint, fingerprint)) {
+          if (cached.shadow) shadows.push(cached.shadow);
+          if (cached.error) diagnostics.push({ filePath, message: cached.error });
+          continue;
+        }
         const definition = parseShadowMarkdown(
           await readFile2(filePath, "utf8"),
           filePath
         );
         this.cache.set(filePath, {
-          mtimeMs: fileStat.mtimeMs,
+          fingerprint,
           shadow: definition
         });
         shadows.push(definition);
       } catch (error) {
+        if (error.code === "ENOENT") {
+          this.cache.delete(filePath);
+          if (await isBrokenSymlink(filePath)) {
+            seen.add(filePath);
+            diagnostics.push({ filePath, message: "broken symlink" });
+          }
+          continue;
+        }
+        seen.add(filePath);
         const message = error instanceof Error ? error.message : String(error);
-        this.cache.set(filePath, { mtimeMs: fileStat.mtimeMs, error: message });
+        if (fingerprint) {
+          this.cache.set(filePath, { fingerprint, error: message });
+        } else {
+          this.cache.delete(filePath);
+        }
         diagnostics.push({ filePath, message });
       }
     }
@@ -6970,18 +7023,20 @@ function parseShadowMarkdown(source, filePath) {
     throw new Error("frontmatter must be an object");
   const value = meta;
   const fallbackId = basename(filePath, extname(filePath));
-  const id = stringValue(value.id, fallbackId, "id");
-  if (!ID_PATTERN.test(id))
+  const id = stringWithFallback(value.id, fallbackId, "id");
+  if (!SHADOW_ID_PATTERN.test(id))
     throw new Error("id must match [a-z0-9][a-z0-9_-]*");
   const prompt = match[2].trim();
   if (!prompt) throw new Error("shadow prompt body is empty");
   return {
     id,
-    name: stringValue(value.name, id, "name"),
+    name: stringWithFallback(value.name, id, "name"),
     enabled: booleanValue(value.enabled, true, "enabled"),
     debug: booleanValue(value.debug, false, "debug"),
-    activationProbability: probabilityValue(
+    activationProbability: numberInRange(
       value.activation_probability,
+      0,
+      1,
       0.3,
       "activation_probability"
     ),
@@ -6991,7 +7046,7 @@ function parseShadowMarkdown(source, filePath) {
       ["*"],
       "active_for_models"
     ),
-    runWithModel: optionalString(value.run_with_model, "run_with_model"),
+    runWithModel: optionalNonEmptyString(value.run_with_model, "run_with_model"),
     thinkingLevel: optionalThinking(value.thinking_level),
     timeoutSeconds: optionalPositiveNumber(
       value.timeout_seconds,
@@ -7011,36 +7066,27 @@ function parseShadowMarkdown(source, filePath) {
     filePath
   };
 }
-function stringValue(value, fallback, name) {
-  if (value === void 0) return fallback;
-  if (!isNonEmptyString(value))
-    throw new Error(`${name} must be a non-empty string`);
-  return value.trim();
+function toFingerprint(fileStat) {
+  return {
+    mtimeNs: fileStat.mtimeNs,
+    ctimeNs: fileStat.ctimeNs,
+    size: fileStat.size,
+    ino: fileStat.ino
+  };
 }
-function optionalString(value, name) {
-  return value === void 0 ? void 0 : stringValue(value, "", name);
+function sameFingerprint(left, right) {
+  return left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs && left.size === right.size && left.ino === right.ino;
+}
+async function isBrokenSymlink(filePath) {
+  try {
+    return (await lstat(filePath)).isSymbolicLink();
+  } catch {
+    return false;
+  }
 }
 function booleanValue(value, fallback, name) {
   if (value === void 0) return fallback;
   if (typeof value !== "boolean") throw new Error(`${name} must be boolean`);
-  return value;
-}
-function probabilityValue(value, fallback, name) {
-  if (value === void 0) return fallback;
-  if (!isFiniteNumber(value) || !inRange(value, 0, 1))
-    throw new Error(`${name} must be between 0 and 1`);
-  return value;
-}
-function optionalPositiveNumber(value, name) {
-  if (value === void 0) return void 0;
-  if (!isFiniteNumber(value) || value <= 0)
-    throw new Error(`${name} must be positive`);
-  return value;
-}
-function optionalNonNegativeInteger(value, name) {
-  if (value === void 0) return void 0;
-  if (!isFiniteNumber(value) || !Number.isInteger(value) || value < 0)
-    throw new Error(`${name} must be a non-negative integer`);
   return value;
 }
 function triggerArray(value, fallback, name) {
@@ -7072,53 +7118,93 @@ var EntityStore = class {
     if (!shadow) throw new Error(`shadow not found: ${id}`);
     return shadow;
   }
-  async create(draft) {
-    if ((await this.list()).some((shadow) => shadow.id === draft.id))
+  async previewCreate(draft) {
+    if (!SHADOW_ID_PATTERN.test(draft.id)) {
+      throw new Error("id must match [a-z0-9][a-z0-9_-]*");
+    }
+    if ((await this.list()).some((shadow) => shadow.id === draft.id)) {
       throw new Error(`shadow already exists: ${draft.id}`);
-    return this.writeParsed(
-      join3(this.registry.directory, `${draft.id}.md`),
-      draft,
-      { overwrite: false }
-    );
-  }
-  async update(id, patch) {
-    const current = await this.get(id);
-    return this.writeParsed(
-      current.filePath,
-      {
-        ...current,
-        ...definedOnly(patch),
-        id,
-        prompt: patch.prompt ?? current.prompt
-      },
-      { overwrite: true }
-    );
-  }
-  async writeParsed(filePath, draft, options) {
+    }
+    const filePath = join3(this.registry.directory, `${draft.id}.md`);
+    if (await pathExists(filePath)) {
+      throw new Error(`shadow file already exists: ${filePath}`);
+    }
     const source = serializeShadow({
       ...draft,
       prompt: draft.prompt ?? "Describe this Shadow Mind's responsibility."
     });
-    const parsed = parseShadowMarkdown(source, filePath);
-    await writeFile2(filePath, source, {
+    const definition = parseShadowMarkdown(source, filePath);
+    return { definition, source, filePath };
+  }
+  async commitCreate(prepared) {
+    await writeFile2(prepared.filePath, prepared.source, {
       encoding: "utf8",
-      ...options.overwrite ? {} : { flag: "wx" }
+      flag: "wx"
     });
-    return parsed;
+    this.registry.invalidate(prepared.filePath);
+    return prepared.definition;
+  }
+  async create(draft) {
+    const prepared = await this.previewCreate(draft);
+    return this.commitCreate(prepared);
+  }
+  async previewUpdate(id, patch) {
+    const current = await this.get(id);
+    const source = serializeShadow({
+      ...current,
+      ...definedOnly(patch),
+      id,
+      prompt: patch.prompt ?? current.prompt
+    });
+    const definition = parseShadowMarkdown(source, current.filePath);
+    return { current, definition, source, filePath: current.filePath };
+  }
+  async commitUpdate(prepared) {
+    await writeFile2(prepared.filePath, prepared.source, { encoding: "utf8" });
+    this.registry.invalidate(prepared.filePath);
+    return prepared.definition;
+  }
+  async update(id, patch) {
+    const prepared = await this.previewUpdate(id, patch);
+    return this.commitUpdate(prepared);
   }
   async setEnabled(id, enabled) {
     return this.update(id, { enabled });
   }
   async delete(id) {
-    await unlink((await this.get(id)).filePath);
+    const filePath = (await this.get(id)).filePath;
+    await unlink(filePath);
+    this.registry.invalidate(filePath);
   }
   async readConfig() {
     return readFile3(this.configPath, "utf8");
+  }
+  async readParsedConfig(fallback = DEFAULT_CONFIG) {
+    try {
+      const raw = await readFile3(this.configPath, "utf8");
+      return parseConfig(JSON.parse(raw));
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return fallback;
+      }
+      throw new Error(
+        `cannot read current config (${this.configPath}): ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
   async writeConfig(config) {
     await writeFile2(this.configPath, serializeConfig(config), "utf8");
   }
 };
+async function pathExists(filePath) {
+  try {
+    await access(filePath);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
 function serializeShadow(shadow) {
   const frontmatter = {
     id: shadow.id,
@@ -7175,6 +7261,7 @@ var FinalResponseBudget = class {
 };
 
 // src/management-tools.ts
+import { basename as basename3 } from "node:path";
 import { Type } from "typebox";
 
 // src/model-resolution.ts
@@ -7232,15 +7319,15 @@ var SHADOW_FIELDS = {
   tools: Type.Optional(Type.Array(Type.String())),
   prompt: Type.Optional(Type.String())
 };
-function registerManagementTools(pi, store, getConfig) {
+function registerManagementTools(pi, store, getConfig, hooks = {}) {
   pi.registerTool(listTool(store));
-  pi.registerTool(createTool(store));
-  pi.registerTool(updateTool(store));
-  pi.registerTool(toggleTool(store, true));
-  pi.registerTool(toggleTool(store, false));
-  pi.registerTool(deleteTool(store));
+  pi.registerTool(createTool(store, hooks));
+  pi.registerTool(updateTool(store, hooks));
+  pi.registerTool(toggleTool(store, true, hooks));
+  pi.registerTool(toggleTool(store, false, hooks));
+  pi.registerTool(deleteTool(store, hooks));
   pi.registerTool(configReadTool(store));
-  pi.registerTool(configWriteTool(store, getConfig));
+  pi.registerTool(configWriteTool(store, getConfig, hooks));
 }
 function listTool(store) {
   return tool(
@@ -7256,7 +7343,7 @@ function listTool(store) {
     }
   );
 }
-function createTool(store) {
+function createTool(store, hooks) {
   return tool(
     "create_shadow",
     "Create Shadow",
@@ -7264,18 +7351,20 @@ function createTool(store) {
     Type.Object({ id: ID, ...SHADOW_FIELDS, prompt: Type.String() }),
     async (_id, params, _signal, _update, ctx) => {
       const raw = params;
+      const prepared = await store.previewCreate(toDraft(raw));
       if (!await confirm(
         ctx,
         "Create Shadow Mind",
-        `Create ${String(raw.id)} in the global registry?`
+        formatCreateConfirmation(prepared.definition)
       ))
         return textResult("Cancelled.");
-      const shadow = await store.create(toDraft(raw));
+      const shadow = await store.commitCreate(prepared);
+      await hooks.onMutated?.(ctx);
       return textResult(`Created ${describeShadow(shadow)}`);
     }
   );
 }
-function updateTool(store) {
+function updateTool(store, hooks) {
   return tool(
     "update_shadow",
     "Update Shadow",
@@ -7283,18 +7372,27 @@ function updateTool(store) {
     Type.Object({ id: ID, ...SHADOW_FIELDS }),
     async (_id, params, _signal, _update, ctx) => {
       const raw = params;
+      const id = String(raw.id);
+      const prepared = await store.previewUpdate(id, toPatch(raw));
+      const diff = formatShadowDiff(prepared.current, prepared.definition);
+      if (diff.length === 0) {
+        return textResult(`No changes for ${id}.`);
+      }
       if (!await confirm(
         ctx,
         "Update Shadow Mind",
-        `Apply changes to ${String(raw.id)}?`
+        `Apply changes to ${id} (${basename3(prepared.filePath)})?
+
+${diff.join("\n")}`
       ))
         return textResult("Cancelled.");
-      const shadow = await store.update(String(raw.id), toPatch(raw));
+      const shadow = await store.commitUpdate(prepared);
+      await hooks.onMutated?.(ctx);
       return textResult(`Updated ${describeShadow(shadow)}`);
     }
   );
 }
-function toggleTool(store, enabled) {
+function toggleTool(store, enabled, hooks) {
   const action = enabled ? "enable" : "disable";
   return tool(
     `${action}_shadow`,
@@ -7303,17 +7401,20 @@ function toggleTool(store, enabled) {
     Type.Object({ id: ID }),
     async (_id, params, _signal, _update, ctx) => {
       const id = String(params.id);
+      const current = await store.get(id);
       if (!await confirm(
         ctx,
         `${enabled ? "Enable" : "Disable"} Shadow Mind`,
-        `${action} ${id}?`
+        `${action} ${id} (${current.name}, currently ${current.enabled ? "enabled" : "disabled"})?`
       ))
         return textResult("Cancelled.");
-      return textResult(describeShadow(await store.setEnabled(id, enabled)));
+      const updated = await store.setEnabled(id, enabled);
+      await hooks.onMutated?.(ctx);
+      return textResult(describeShadow(updated));
     }
   );
 }
-function deleteTool(store) {
+function deleteTool(store, hooks) {
   return tool(
     "delete_shadow",
     "Delete Shadow",
@@ -7321,13 +7422,15 @@ function deleteTool(store) {
     Type.Object({ id: ID }),
     async (_id, params, _signal, _update, ctx) => {
       const id = String(params.id);
+      const current = await store.get(id);
       if (!await confirm(
         ctx,
         "Delete Shadow Mind",
-        `Delete ${id}? Its debug logs will be kept.`
+        `Delete ${id} (${current.name}, file ${basename3(current.filePath)})? Its debug logs will be kept.`
       ))
         return textResult("Cancelled.");
       await store.delete(id);
+      await hooks.onMutated?.(ctx);
       return textResult(`Deleted ${id}; logs were retained.`);
     }
   );
@@ -7341,7 +7444,7 @@ function configReadTool(store) {
     async () => textResult(await store.readConfig())
   );
 }
-function configWriteTool(store, getConfig) {
+function configWriteTool(store, getConfig, hooks) {
   return tool(
     "update_shadow_config",
     "Update Shadow Config",
@@ -7367,7 +7470,7 @@ function configWriteTool(store, getConfig) {
       )
     }),
     async (_id, params, _signal, _update, ctx) => {
-      const current = getConfig();
+      const current = await store.readParsedConfig(getConfig());
       const raw = params;
       const next = parseConfig({
         heartbeat_probability: raw.heartbeat_probability ?? current.heartbeatProbability,
@@ -7381,19 +7484,27 @@ function configWriteTool(store, getConfig) {
         default_thinking_level: raw.default_thinking_level ?? current.defaultThinkingLevel,
         random_seed: raw.random_seed ?? current.randomSeed
       });
-      if (next.defaultShadowModel && ctx.modelRegistry && !resolveModel(ctx, next.defaultShadowModel)) {
+      if (raw.default_shadow_model !== void 0 && next.defaultShadowModel && ctx.modelRegistry && !resolveModel(ctx, next.defaultShadowModel)) {
         throw new Error(
-          `unknown shadow model: ${next.defaultShadowModel}. Pass provider/modelId, e.g. magpie/autoclaw-cn/zai_glm-5.3-flash.`
+          `unknown shadow model: ${next.defaultShadowModel}. Pass provider/modelId, e.g. openai/gpt-5-mini.`
         );
+      }
+      const diff = formatConfigDiff(current, next);
+      if (diff.length === 0) {
+        return textResult("No changes to Shadow Mind config.");
       }
       if (!await confirm(
         ctx,
         "Update Shadow Config",
-        `Apply this config?
+        `Apply config changes?
+
+${diff.join("\n")}
+
 ${JSON.stringify(next, null, 2)}`
       ))
         return textResult("Cancelled.");
       await store.writeConfig(next);
+      await hooks.onMutated?.(ctx);
       return textResult("Shadow Mind config updated.");
     }
   );
@@ -7430,6 +7541,73 @@ function toPatch(raw) {
     tools: raw.tools,
     prompt: raw.prompt
   };
+}
+function formatCreateConfirmation(shadow) {
+  const toolsText = shadow.tools.length ? shadow.tools.join(", ") : "(default read-only)";
+  const lines = [
+    `Create ${shadow.id} (${shadow.name}) in ${basename3(shadow.filePath)}?`,
+    `enabled: ${shadow.enabled}`,
+    `debug: ${shadow.debug}`,
+    `trigger: ${shadow.trigger.join(", ")}`,
+    `activation_probability: ${shadow.activationProbability}`,
+    `active_for_models: ${shadow.activeForModels.join(", ")}`,
+    ...shadow.runWithModel ? [`run_with_model: ${shadow.runWithModel}`] : [],
+    ...shadow.thinkingLevel ? [`thinking_level: ${shadow.thinkingLevel}`] : [],
+    ...shadow.timeoutSeconds !== void 0 ? [`timeout_seconds: ${shadow.timeoutSeconds}`] : [],
+    ...shadow.finalResponseRounds !== void 0 ? [`final_response_rounds: ${shadow.finalResponseRounds}`] : [],
+    ...shadow.activationTools.length ? [`activation_tools: ${shadow.activationTools.join(", ")}`] : [],
+    `tools: ${toolsText}`,
+    "",
+    "prompt:",
+    shadow.prompt
+  ];
+  return lines.join("\n");
+}
+function formatShadowDiff(current, next) {
+  const fields = [
+    ["name", current.name, next.name],
+    ["enabled", current.enabled, next.enabled],
+    ["debug", current.debug, next.debug],
+    ["activation_probability", current.activationProbability, next.activationProbability],
+    ["trigger", current.trigger, next.trigger],
+    ["active_for_models", current.activeForModels, next.activeForModels],
+    ["run_with_model", current.runWithModel, next.runWithModel],
+    ["thinking_level", current.thinkingLevel, next.thinkingLevel],
+    ["timeout_seconds", current.timeoutSeconds, next.timeoutSeconds],
+    ["final_response_rounds", current.finalResponseRounds, next.finalResponseRounds],
+    ["activation_tools", current.activationTools, next.activationTools],
+    ["tools", current.tools, next.tools]
+  ];
+  const diffs = fields.filter(([, oldVal, newVal]) => !sameValue(oldVal, newVal)).map(([name, oldVal, newVal]) => `${name}: ${formatValue(oldVal)} -> ${formatValue(newVal)}`);
+  if (current.prompt !== next.prompt) {
+    diffs.push(`prompt:
+--- before ---
+${current.prompt}
+--- after ---
+${next.prompt}`);
+  }
+  return diffs;
+}
+function formatConfigDiff(current, next) {
+  const fields = [
+    ["heartbeat_probability", current.heartbeatProbability, next.heartbeatProbability],
+    ["heartbeat_tools", current.heartbeatTools, next.heartbeatTools],
+    ["max_parallel_shadows", current.maxParallelShadows, next.maxParallelShadows],
+    ["default_shadow_timeout_seconds", current.defaultShadowTimeoutSeconds, next.defaultShadowTimeoutSeconds],
+    ["headless_drain_timeout_seconds", current.headlessDrainTimeoutSeconds, next.headlessDrainTimeoutSeconds],
+    ["result_batch_window_ms", current.resultBatchWindowMs, next.resultBatchWindowMs],
+    ["excluded_extensions", current.excludedExtensions, next.excludedExtensions],
+    ["default_shadow_model", current.defaultShadowModel, next.defaultShadowModel],
+    ["default_thinking_level", current.defaultThinkingLevel, next.defaultThinkingLevel],
+    ["random_seed", current.randomSeed, next.randomSeed]
+  ];
+  return fields.filter(([, oldVal, newVal]) => !sameValue(oldVal, newVal)).map(([name, oldVal, newVal]) => `${name}: ${formatValue(oldVal)} -> ${formatValue(newVal)}`);
+}
+function sameValue(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+function formatValue(value) {
+  return value === void 0 ? "(unset)" : JSON.stringify(value);
 }
 
 // src/report-batcher.ts
@@ -7743,9 +7921,12 @@ function removeOrphanedTools(messages) {
     const calls = toolCalls(message);
     if (!calls.length || message.role !== "assistant") return [message];
     const retained = calls.filter((call) => call.name === "compress" || resultIds.has(call.id));
-    if (!retained.length) return [];
     const ids = new Set(retained.map((call) => call.id));
-    return [{ ...message, content: message.content.filter((part) => part.type !== "toolCall" || ids.has(part.id)) }];
+    const content = message.content.filter((part) => part.type !== "toolCall" || ids.has(part.id));
+    const hasContent = content.some(
+      (part) => part.type === "toolCall" || part.type === "text" && part.text.trim().length > 0
+    );
+    return hasContent ? [{ ...message, content }] : [];
   });
   const callIds = new Set(paired.flatMap((message) => toolCalls(message).map((call) => call.id)));
   return paired.filter((message) => message.role !== "toolResult" || callIds.has(message.toolCallId));
@@ -7773,6 +7954,10 @@ function shouldEvaluateFinalResponse(messages) {
   const message = messages.at(-1);
   if (!message || typeof message !== "object" || message.role !== "assistant")
     return false;
+  const stopReason = message.stopReason;
+  if (stopReason !== void 0 && stopReason !== "stop" && stopReason !== "length") {
+    return false;
+  }
   const content = message.content;
   if (typeof content === "string") return content.trim().length > 0;
   return Array.isArray(content) && content.some((block) => {
@@ -7896,13 +8081,12 @@ function modelPatternMatches(pattern, fullModelId) {
   if (pattern === fullModelId) return true;
   const slashIndex = fullModelId.indexOf("/");
   const modelId = slashIndex !== -1 ? fullModelId.slice(slashIndex + 1) : fullModelId;
-  if (!pattern.includes("/") && pattern === modelId) {
+  if (pattern === modelId) {
     return true;
   }
   if (pattern.includes("*")) {
     const regex = wildcardToRegex(pattern);
-    if (regex.test(fullModelId)) return true;
-    if (!pattern.includes("/") && regex.test(modelId)) return true;
+    if (regex.test(fullModelId) || regex.test(modelId)) return true;
   }
   return false;
 }
@@ -8044,9 +8228,6 @@ Calling report_to_main ends this run immediately. If relevant work produces noth
 var KICKOFF = `First decide whether the trajectory is relevant to this Shadow Mind's responsibility.
 If it is unrelated, reply exactly NOT_RELEVANT and stop immediately. Do not call any tool, including report_to_main.
 If it is relevant, perform the Shadow Mind's responsibility now. Call report_to_main only when the main agent should receive a result.`;
-function buildShadowSystemPrompt(mainSystemPrompt) {
-  return mainSystemPrompt;
-}
 function buildShadowRequest(trajectory, shadow) {
   return `${trajectory}
 
@@ -8066,6 +8247,7 @@ var summarizers = /* @__PURE__ */ new Map([
   ["find", (result) => summarizeLines(result, "paths")],
   ["ls", (result) => summarizeLines(result, "entries")]
 ]);
+var MAX_PREVIEW_CHARS = 120;
 function summarizeToolResult(result) {
   const summary = summarizers.get(result.toolName ?? "")?.(result) ?? summarizeGeneric(result);
   return result.isError ? `error \xB7 ${summary}` : summary;
@@ -8074,7 +8256,8 @@ function summarizeLines(result, noun) {
   const text = textContent(result.content);
   if (!text) return `0 ${noun}`;
   const lines = text.split(/\r?\n/).filter(Boolean);
-  const preview = compact(lines[0] ?? "");
+  const rawPreview = compact(lines[0] ?? "");
+  const preview = rawPreview.length > MAX_PREVIEW_CHARS ? `${rawPreview.slice(0, MAX_PREVIEW_CHARS - 1)}\u2026` : rawPreview;
   return `${lines.length} ${noun}${preview ? ` \xB7 ${preview}` : ""}`;
 }
 function summarizeGeneric(result) {
@@ -8114,6 +8297,7 @@ function serializeTrajectory(messages) {
     }
   }
   const lines = [];
+  const matchedToolCallIds = /* @__PURE__ */ new Set();
   for (const message of messages) {
     if (message.role === "user") {
       appendText(lines, "USER", message.content);
@@ -8131,13 +8315,14 @@ function serializeTrajectory(messages) {
         if (item.type === "toolCall" && item.name) {
           const call = `${item.name}(${compactJson(item.arguments)})`;
           const result = item.id ? results.get(item.id) : void 0;
+          if (item.id && result !== void 0) matchedToolCallIds.add(item.id);
           lines.push(`TOOL: ${call}${result ? ` \xB7 ${result}` : ""}`);
         }
       }
       continue;
     }
     if (message.role === "toolResult") {
-      if (typeof message.toolCallId !== "string" || !results.has(message.toolCallId)) {
+      if (typeof message.toolCallId !== "string" || !matchedToolCallIds.has(message.toolCallId)) {
         lines.push(`TOOL RESULT: ${summarizeToolResult(message)}`);
       }
       continue;
@@ -8176,31 +8361,39 @@ function compactJson(value) {
 }
 
 // src/extension-filter.ts
-import { readFileSync as readFileSync2 } from "node:fs";
+import { readFileSync as readFileSync2, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename as basename3, dirname as dirname2, join as join4, normalize, resolve } from "node:path";
+import { basename as basename4, dirname as dirname2, join as join4, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-var SELF_PATH = normalize(resolve(fileURLToPath(import.meta.url)));
-var SELF_DIRECTORY = dirname2(SELF_PATH);
+var SELF_PATH = canonicalPath(fileURLToPath(import.meta.url));
+var SELF_FALLBACK_PATH = normalizeCase(normalize(resolve(fileURLToPath(import.meta.url))));
+var SELF_DIRECTORIES = /* @__PURE__ */ new Set([dirname2(SELF_PATH), dirname2(SELF_FALLBACK_PATH)]);
 var SELF_ENTRIES = /* @__PURE__ */ new Set(["index.ts", "index.js"]);
 function isSelfExtension(candidate) {
-  const normalized = normalize(resolve(candidate));
-  if (normalized === SELF_PATH) return true;
-  return dirname2(normalized) === SELF_DIRECTORY && SELF_ENTRIES.has(basename3(normalized));
+  if (isVirtualExtensionPath(candidate)) return false;
+  const fallback = normalizeCase(normalize(resolve(candidate)));
+  const canonical = canonicalPath(candidate);
+  if (fallback === SELF_FALLBACK_PATH || canonical === SELF_PATH) return true;
+  return SELF_ENTRIES.has(basename4(fallback)) && SELF_DIRECTORIES.has(dirname2(fallback)) || SELF_ENTRIES.has(basename4(canonical)) && SELF_DIRECTORIES.has(dirname2(canonical));
 }
 var PACKAGE_LOOKUP_DEPTH = 4;
 var GENERIC_ENTRY_FILE = /^index\.[^.]+$/;
 var packageNameCache = /* @__PURE__ */ new Map();
 function extensionIdentifiers(resolvedPath) {
-  const normalized = normalize(resolve(resolvedPath));
-  const identifiers = /* @__PURE__ */ new Set([normalized]);
-  const owner = findPackage(dirname2(normalized));
+  if (isVirtualExtensionPath(resolvedPath)) {
+    return /* @__PURE__ */ new Set([resolvedPath, stripScheme(resolvedPath)]);
+  }
+  const normalized = normalizeCase(normalize(resolve(resolvedPath)));
+  const canonical = canonicalPath(resolvedPath);
+  const identifiers = /* @__PURE__ */ new Set([normalized, canonical]);
+  const owner = findPackage(dirname2(canonical)) ?? findPackage(dirname2(normalized));
   if (owner) {
     identifiers.add(owner.name);
-    identifiers.add(basename3(owner.directory));
+    identifiers.add(basename4(owner.directory));
     identifiers.add(owner.directory);
+    identifiers.add(normalizeCase(owner.directory));
   }
-  const fileName = basename3(normalized);
+  const fileName = basename4(normalized);
   if (!GENERIC_ENTRY_FILE.test(fileName)) {
     identifiers.add(fileName);
     identifiers.add(fileName.replace(/\.[^.]+$/, ""));
@@ -8214,7 +8407,11 @@ function createExtensionExcluder(entries) {
     if (!trimmed) continue;
     wanted.add(trimmed);
     wanted.add(stripScheme(trimmed));
-    wanted.add(normalize(resolve(expandHome(trimmed))));
+    if (looksLikePath(trimmed)) {
+      const expanded = expandHome(trimmed);
+      wanted.add(normalizeCase(normalize(resolve(expanded))));
+      wanted.add(canonicalPath(expanded));
+    }
   }
   if (wanted.size === 0) return () => false;
   return (resolvedPath) => {
@@ -8226,11 +8423,11 @@ function createExtensionExcluder(entries) {
 }
 function findPackage(directory) {
   if (packageNameCache.has(directory)) return packageNameCache.get(directory);
-  const home = resolve(homedir());
+  const home = canonicalPath(homedir());
   let current = directory;
   let found;
   for (let depth = 0; depth < PACKAGE_LOOKUP_DEPTH; depth += 1) {
-    if (basename3(current) === "node_modules" || current === home) break;
+    if (basename4(current) === "node_modules" || normalizeCase(current) === home) break;
     const name = readPackageName(current);
     if (name) {
       found = { name, directory: current };
@@ -8253,10 +8450,32 @@ function readPackageName(directory) {
   }
 }
 function stripScheme(source) {
+  if (/^[a-zA-Z]:[\\/]/.test(source)) return source;
   return source.replace(/^[a-z][a-z0-9+.-]+:/i, "");
 }
 function expandHome(entry) {
-  return entry === "~" || entry.startsWith("~/") ? resolve(homedir(), entry.slice(2)) : entry;
+  return entry === "~" || entry.startsWith("~/") || entry.startsWith("~\\") ? resolve(homedir(), entry.slice(2)) : entry;
+}
+function isVirtualExtensionPath(path) {
+  if (path.startsWith("<") && path.endsWith(">")) return true;
+  if (/^[a-zA-Z]:[\\/]/.test(path)) return false;
+  return /^[a-z][a-z0-9+.-]*:/i.test(path);
+}
+function looksLikePath(entry) {
+  if (entry.startsWith("@")) return false;
+  return entry === "~" || entry.startsWith("~/") || entry.startsWith("~\\") || entry.startsWith(".") || /^[a-zA-Z]:[\\/]/.test(entry) || entry.includes("/") || entry.includes("\\");
+}
+function canonicalPath(filePath) {
+  const resolved = normalize(resolve(filePath));
+  let target = resolved;
+  try {
+    target = realpathSync(resolved);
+  } catch {
+  }
+  return normalizeCase(normalize(target));
+}
+function normalizeCase(filePath) {
+  return process.platform === "win32" ? filePath.toLowerCase() : filePath;
 }
 
 // src/shadow-runner.ts
@@ -8320,22 +8539,36 @@ var ShadowRunner = class {
       assertShadowModelAuth(model, request);
       const trajectory = serializeTrajectory(request.messages);
       assertTrajectoryFits(model, [trajectory]);
-      sessionManager = await createShadowSessionManager(request);
-      const boot = await this.bootstrapSession(request, model, controller, state, sessionManager);
+      const timeoutMs = (request.shadow.timeoutSeconds ?? request.config.defaultShadowTimeoutSeconds) * 1e3;
+      timeout = setTimeout(() => {
+        state.timedOut = true;
+        controller.abort();
+      }, timeoutMs);
+      sessionManager = await raceWithAbort(createShadowSessionManager(request), controller.signal);
+      const bootPromise = this.bootstrapSession(request, model, controller, state, sessionManager);
+      void bootPromise.then(
+        (late) => {
+          if (controller.signal.aborted && state.session !== late.session) {
+            this.abortSession(late.session);
+            try {
+              late.session.dispose();
+            } catch {
+            }
+          }
+        },
+        () => {
+        }
+      );
+      const boot = await raceWithAbort(bootPromise, controller.signal);
       state.session = boot.session;
       missingTools = boot.missingTools;
       thinkingLevel = boot.thinkingLevel;
       baseMessageCount = boot.session.messages.length;
       this.controllers.set(request.runId, { controller, session: boot.session });
       if (controller.signal.aborted) {
-        finalReason = "aborted";
+        finalReason = runReason(state.timedOut, state.reported, controller.signal.aborted);
         return buildRunResult({ reason: finalReason, durationMs: Date.now() - started, session: boot.session, baseMessageCount, missingTools, thinkingLevel });
       }
-      const timeoutMs = (request.shadow.timeoutSeconds ?? request.config.defaultShadowTimeoutSeconds) * 1e3;
-      timeout = setTimeout(() => {
-        state.timedOut = true;
-        controller.abort();
-      }, timeoutMs);
       controller.signal.addEventListener("abort", () => this.abortSession(boot.session), { once: true });
       await boot.session.prompt(buildShadowRequest(trajectory, request.shadow));
       await boot.session.waitForIdle();
@@ -8360,12 +8593,14 @@ var ShadowRunner = class {
       cwd: request.cwd,
       agentDir: request.agentDir,
       settingsManager,
-      systemPrompt: buildShadowSystemPrompt(request.mainSystemPrompt),
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+      systemPrompt: request.mainSystemPrompt,
       // The inherited main system prompt already embeds APPEND_SYSTEM.md,
-      // AGENTS.md and skills; keep the loader from re-discovering them so the
-      // shadow context stays a strict subset (no duplication).
+      // AGENTS.md and skills; keep extension-bundled skills suppressed too.
       appendSystemPrompt: [],
-      agentsFilesOverride: () => ({ agentsFiles: [] }),
       skillsOverride: (base) => ({ skills: [], diagnostics: base.diagnostics }),
       // Drop this plugin itself plus every extension the user excluded, so
       // session-scoped extensions (archivers, recorders) never treat an internal
@@ -8378,6 +8613,9 @@ var ShadowRunner = class {
       })
     });
     await resourceLoader.reload();
+    if (controller.signal.aborted) {
+      throw new Error("Shadow run aborted during bootstrap");
+    }
     const reportTool = createReportTool((content) => {
       if (state.reported || controller.signal.aborted) return;
       state.reported = true;
@@ -8402,6 +8640,10 @@ var ShadowRunner = class {
       sessionManager,
       settingsManager
     });
+    if (controller.signal.aborted) {
+      created.session.dispose();
+      throw new Error("Shadow run aborted during bootstrap");
+    }
     const missingTools = tools.filter((name) => !created.session.getActiveToolNames().includes(name));
     return { session: created.session, missingTools, thinkingLevel };
   }
@@ -8433,23 +8675,45 @@ function usageMetrics(messages) {
   let aggregate = zeroUsage();
   for (const message of messages) {
     if (message.role !== "assistant" || !message.usage) continue;
+    const usage = message.usage;
+    const cost = usage.cost;
     aggregate = addUsage(aggregate, {
       requests: 1,
-      input: message.usage.input,
-      output: message.usage.output,
-      cacheRead: message.usage.cacheRead,
-      cacheWrite: message.usage.cacheWrite,
-      totalTokens: message.usage.totalTokens,
+      input: safeUsageNumber(usage.input),
+      output: safeUsageNumber(usage.output),
+      cacheRead: safeUsageNumber(usage.cacheRead),
+      cacheWrite: safeUsageNumber(usage.cacheWrite),
+      totalTokens: safeUsageNumber(usage.totalTokens),
       cost: {
-        input: message.usage.cost.input,
-        output: message.usage.cost.output,
-        cacheRead: message.usage.cost.cacheRead,
-        cacheWrite: message.usage.cost.cacheWrite,
-        total: message.usage.cost.total
+        input: safeUsageNumber(cost?.input),
+        output: safeUsageNumber(cost?.output),
+        cacheRead: safeUsageNumber(cost?.cacheRead),
+        cacheWrite: safeUsageNumber(cost?.cacheWrite),
+        total: safeUsageNumber(cost?.total)
       }
     });
   }
   return aggregate;
+}
+function safeUsageNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+function raceWithAbort(promise, signal) {
+  if (signal.aborted) return Promise.reject(new Error("Shadow run aborted"));
+  return new Promise((resolve2, reject) => {
+    const onAbort = () => reject(new Error("Shadow run aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve2(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
 }
 function createReportTool(onReport) {
   return {
@@ -8460,6 +8724,13 @@ function createReportTool(onReport) {
     parameters: Type2.Object({ content: Type2.String({ description: "The complete report for the main agent" }) }),
     async execute(_toolCallId, params) {
       const content = params.content;
+      if (typeof content !== "string" || content.trim().length === 0) {
+        return {
+          content: [{ type: "text", text: "Report rejected: content must be non-empty." }],
+          details: {},
+          isError: true
+        };
+      }
       onReport(content);
       return { content: [{ type: "text", text: "Report delivered." }], details: {}, terminate: true };
     }
@@ -8548,6 +8819,104 @@ async function waitForSettled(options) {
   return { settled: false, durationMs: now() - started };
 }
 
+// src/status-presenter.ts
+var MAX_RECENT_EVENTS = 20;
+var MAX_RECENT_RUNS = 5;
+var StatusPresenter = class {
+  panelVisible = false;
+  shadowCount = 0;
+  diagnostics = [];
+  recentEvents = [];
+  recentRuns = [];
+  reset() {
+    this.recentRuns.length = 0;
+    this.recentEvents.length = 0;
+    this.diagnostics = [];
+    this.shadowCount = 0;
+  }
+  recordEvent(event) {
+    this.recentEvents.push(event);
+    if (this.recentEvents.length > MAX_RECENT_EVENTS) {
+      this.recentEvents.shift();
+    }
+  }
+  recordRun(shadowName, result, completedAt = (/* @__PURE__ */ new Date()).toISOString()) {
+    this.recentRuns.push({ shadowName, completedAt, result });
+    if (this.recentRuns.length > MAX_RECENT_RUNS) {
+      this.recentRuns.shift();
+    }
+  }
+  setRegistrySnapshot(shadowCount, diagnostics) {
+    this.shadowCount = shadowCount;
+    this.diagnostics = diagnostics;
+  }
+  hasDiagnostics(usageError) {
+    return this.allDiagnostics(usageError).length > 0;
+  }
+  togglePanel() {
+    this.panelVisible = !this.panelVisible;
+    return this.panelVisible;
+  }
+  hidePanel(ctx) {
+    this.panelVisible = false;
+    ctx?.ui.setWidget("shadow-mind-panel", void 0);
+  }
+  update(ctx, snapshot) {
+    const diagnostics = this.allDiagnostics(snapshot.usageError);
+    const warning = diagnostics.length || this.hasRecentRunErrors() ? " !" : "";
+    const usage = `${formatUsageTokens(snapshot.sessionUsage.totalTokens)} \xB7 ${formatUsageCost(snapshot.sessionUsage.cost.total)}`;
+    ctx.ui.setStatus(
+      "shadow-mind",
+      snapshot.paused ? `\u{1F419} Paused \xB7 ${usage}${warning}` : `\u{1F419} ${snapshot.activeCount} \xB7 ${usage}${warning}`
+    );
+    if (this.panelVisible) {
+      ctx.ui.setWidget("shadow-mind-panel", this.statusLines(snapshot), {
+        placement: "aboveEditor"
+      });
+    }
+  }
+  statusLines(snapshot) {
+    const { config } = snapshot;
+    const diagnostics = this.allDiagnostics(snapshot.usageError);
+    return [
+      `\u{1F419} Shadow Mind \xB7 ${snapshot.paused ? "paused" : "active"} \xB7 running ${snapshot.activeCount}/${config.maxParallelShadows}`,
+      `heartbeat ${formatNumber(config.heartbeatProbability)} \xB7 batch ${config.resultBatchWindowMs}ms \xB7 timeout ${config.defaultShadowTimeoutSeconds}s \xB7 drain ${config.headlessDrainTimeoutSeconds}s \xB7 thinking ${config.defaultThinkingLevel}`,
+      `definitions: ${this.shadowCount} valid \xB7 ${this.diagnostics.length} invalid`,
+      formatUsageDetail("session", snapshot.sessionUsage),
+      `usage lifetime \xB7 ${formatUsageSummary(snapshot.lifetimeUsage)}`,
+      ...this.recentRuns.slice(-3).map(
+        ({ shadowName, completedAt, result }) => `recent run \xB7 ${formatCompletedAt(completedAt)} \xB7 ${shadowName} \xB7 ${result.reason} \xB7 ${formatUsageSummary(result.usage)}`
+      ),
+      ...diagnostics.map((diagnostic) => `diagnostic: ${diagnostic}`),
+      ...this.recentEvents.slice(-5).map((event) => {
+        const failed = event.kind === "run-end" && (event.data?.reason === "error" || event.data?.reason === "timeout");
+        const detail = failed ? ` ${event.data?.error ?? event.data?.reason}` : "";
+        return `${new Date(event.at).toLocaleTimeString("en-GB", { hour12: false })} ${event.kind}${detail}`;
+      }),
+      "Shortcut: Alt+S toggle \xB7 Commands: /shadow toggle | pause | resume | status | hide | reports"
+    ];
+  }
+  allDiagnostics(usageError) {
+    return usageError ? [...this.diagnostics, `usage: ${usageError}`] : this.diagnostics;
+  }
+  hasRecentRunErrors() {
+    return this.recentEvents.slice(-3).some(
+      (event) => event.kind === "run-end" && (event.data?.reason === "error" || event.data?.reason === "timeout")
+    );
+  }
+};
+function formatNumber(value) {
+  return Number(value.toFixed(3)).toString();
+}
+function formatCompletedAt(completedAt) {
+  return new Date(completedAt).toLocaleTimeString("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  });
+}
+
 // src/usage-store.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { mkdir as mkdir5, readFile as readFile5, rename as rename2, rm as rm2, writeFile as writeFile4 } from "node:fs/promises";
@@ -8563,12 +8932,16 @@ async function acquireUsageFileLock(usagePath, timing = {}) {
   const resolved = resolveTiming(timing);
   const lockPath = `${usagePath}.lock`;
   const owner = { token: randomUUID(), pid: process.pid };
+  const deadline = Date.now() + resolved.acquireTimeoutMs;
   while (true) {
     try {
       await mkdir4(lockPath);
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
       await recoverStaleUsageLock(lockPath, resolved);
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out acquiring usage file lock: ${lockPath}`);
+      }
       await delay(resolved.retryMs);
       continue;
     }
@@ -8609,44 +8982,62 @@ async function recoverStaleUsageLock(lockPath, timing) {
   if (!observed || !isRecoverableUsageLock(observed, timing.staleMs)) return;
   const operationPath = join6(lockPath, USAGE_LOCK_OPERATION_DIRECTORY);
   if (!await claimUsageLockOperation(operationPath, timing)) return;
+  let renamed = false;
   try {
     const current = await readUsageLockState(lockPath);
     if (!current || !sameUsageLock(current, observed) || !isRecoverableUsageLock(current, timing.staleMs)) return;
     const abandonedPath = `${lockPath}.${randomUUID()}.stale`;
     try {
       await rename(lockPath, abandonedPath);
+      renamed = true;
     } catch (error) {
-      if (error.code === "ENOENT") return;
+      const code = error.code;
+      if (code === "ENOENT" || isTransientRenameError(code)) return;
       throw error;
     }
     await rm(abandonedPath, { recursive: true, force: true });
   } finally {
-    await rm(operationPath, { recursive: true, force: true }).catch(() => void 0);
+    if (!renamed) {
+      await rm(operationPath, { recursive: true, force: true }).catch(() => void 0);
+    }
   }
 }
 async function releaseUsageLock(lockPath, token, timing) {
   const operationPath = join6(lockPath, USAGE_LOCK_OPERATION_DIRECTORY);
+  const deadline = Date.now() + timing.releaseTimeoutMs;
   while (true) {
     const observed = await readUsageLockState(lockPath);
     if (!observed || observed.owner?.token !== token) return;
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out releasing usage file lock: ${lockPath}`);
+    }
     if (!await claimUsageLockOperation(operationPath, timing)) {
       await delay(timing.retryMs);
       continue;
     }
+    let renamed = false;
     try {
       const current = await readUsageLockState(lockPath);
       if (!current || current.owner?.token !== token) return;
       const releasedPath = `${lockPath}.${token}.released`;
       try {
         await rename(lockPath, releasedPath);
+        renamed = true;
       } catch (error) {
-        if (error.code === "ENOENT") continue;
+        const code = error.code;
+        if (code === "ENOENT") continue;
+        if (isTransientRenameError(code)) {
+          await delay(timing.retryMs);
+          continue;
+        }
         throw error;
       }
       await rm(releasedPath, { recursive: true, force: true });
       return;
     } finally {
-      await rm(operationPath, { recursive: true, force: true }).catch(() => void 0);
+      if (!renamed) {
+        await rm(operationPath, { recursive: true, force: true }).catch(() => void 0);
+      }
     }
   }
 }
@@ -8673,7 +9064,8 @@ async function claimUsageLockOperation(operationPath, timing) {
   try {
     await rename(operationPath, abandonedPath);
   } catch (error) {
-    if (error.code === "ENOENT") return false;
+    const code = error.code;
+    if (code === "ENOENT" || isTransientRenameError(code)) return false;
     throw error;
   }
   await rm(abandonedPath, { recursive: true, force: true });
@@ -8731,11 +9123,16 @@ function isProcessAlive(pid) {
 function sameUsageLock(left, right) {
   return left.owner !== void 0 && right.owner !== void 0 ? left.owner.token === right.owner.token : left.owner === right.owner && left.dev === right.dev && left.ino === right.ino;
 }
+function isTransientRenameError(code) {
+  return code === "EPERM" || code === "EBUSY" || code === "EACCES";
+}
 function resolveTiming(timing) {
   return {
     retryMs: timing.retryMs ?? 25,
     staleMs: timing.staleMs ?? 3e4,
-    heartbeatMs: timing.heartbeatMs ?? 1e4
+    heartbeatMs: timing.heartbeatMs ?? 1e4,
+    acquireTimeoutMs: timing.acquireTimeoutMs ?? 1e4,
+    releaseTimeoutMs: timing.releaseTimeoutMs ?? 1e4
   };
 }
 function delay(ms) {
@@ -8749,14 +9146,17 @@ var UsageStore = class {
   lifetime = zeroUsage();
   pendingUsage = zeroUsage();
   lastError;
-  initialization;
   pendingWrite = Promise.resolve();
   constructor(agentDir) {
     this.usagePath = join7(agentDir, "shadow-minds", "usage.json");
   }
-  initialize() {
-    this.initialization ??= this.load();
-    return this.initialization;
+  async initialize() {
+    const reload = this.pendingWrite.then(
+      () => this.load(),
+      () => this.load()
+    );
+    this.pendingWrite = reload;
+    await reload;
   }
   get current() {
     return {
@@ -8793,15 +9193,15 @@ var UsageStore = class {
   async load() {
     try {
       const raw = await readFile5(this.usagePath, "utf8");
-      this.lifetime = parseUsageDocument(JSON.parse(raw)).lifetime;
+      this.lifetime = addUsage(parseUsageDocument(JSON.parse(raw)).lifetime, this.pendingUsage);
       this.lastError = void 0;
     } catch (error) {
       if (error.code === "ENOENT") {
-        this.lifetime = zeroUsage();
+        this.lifetime = addUsage(zeroUsage(), this.pendingUsage);
         this.lastError = void 0;
         return;
       }
-      this.lifetime = zeroUsage();
+      this.lifetime = addUsage(zeroUsage(), this.pendingUsage);
       this.lastError = error instanceof Error ? error.message : String(error);
     }
   }
@@ -8942,39 +9342,42 @@ var ShadowMindRuntime = class {
     },
     onReviewCompleted: (shadowIds) => this.finalResponseBudget.commit(shadowIds)
   });
-  recentEvents = [];
-  recentRuns = [];
+  presenter = new StatusPresenter();
   reports = new ReportBrowser();
   batcher;
   sessionLifetime = new SessionLifetime();
   epoch = 0;
   modelCalls = 0;
   paused = false;
-  panelVisible = false;
+  shuttingDown = false;
   latestContext;
-  diagnostics = [];
   sessionUsage = zeroUsage();
-  shadowCount = 0;
   completedWithFinalText = false;
   random = Math.random;
   register() {
     registerManagementTools(
       this.pi,
       this.entityStore,
-      () => this.configStore.current
+      () => this.configStore.current,
+      {
+        onMutated: async (ctx) => {
+          await this.refresh(ctx);
+        }
+      }
     );
     this.registerEvents();
     this.registerUi();
   }
   registerEvents() {
     this.pi.on("session_start", async (_event, ctx) => {
+      this.shuttingDown = false;
       this.sessionLifetime.activate();
       this.latestContext = ctx;
       this.modelCalls = 0;
       this.completedWithFinalText = false;
       this.finalResponseBudget.reset();
       this.sessionUsage = zeroUsage();
-      this.recentRuns.length = 0;
+      this.presenter.reset();
       this.reports.reset();
       await this.configStore.initialize();
       await this.usageStore.initialize();
@@ -8993,6 +9396,15 @@ var ShadowMindRuntime = class {
       this.finalResponseBudget.reset();
       this.epoch += 1;
       this.abortAll("new-user-input");
+      this.updateStatus(ctx);
+    });
+    this.pi.on("session_tree", (_event, ctx) => {
+      this.latestContext = ctx;
+      this.completedWithFinalText = false;
+      this.finalResponseBudget.reset();
+      this.epoch += 1;
+      this.abortAll("session-tree");
+      this.updateStatus(ctx);
     });
     this.pi.on("after_provider_response", (_event, ctx) => {
       this.latestContext = ctx;
@@ -9015,8 +9427,16 @@ var ShadowMindRuntime = class {
       this.latestContext = ctx;
       this.completedWithFinalText = shouldEvaluateFinalResponse(event.messages);
     });
-    this.pi.on("agent_settled", async (_event, ctx) => {
+    this.pi.on("agent_settled", async (event, ctx) => {
       this.latestContext = ctx;
+      if (event?.aborted) {
+        this.completedWithFinalText = false;
+        this.epoch += 1;
+        this.abortAll("user-aborted");
+        this.record("final-response-skipped", { reason: "aborted" });
+        this.updateStatus(ctx);
+        return;
+      }
       if (!this.completedWithFinalText) {
         this.record("final-response-skipped", {
           reason: "no-final-assistant-text"
@@ -9027,6 +9447,7 @@ var ShadowMindRuntime = class {
       await this.onFinalResponse(ctx);
     });
     this.pi.on("session_shutdown", async (event, ctx) => {
+      this.shuttingDown = true;
       this.latestContext = ctx;
       if (event.reason === "quit" && (ctx.mode === "print" || ctx.mode === "json")) {
         await this.drainHeadless(ctx);
@@ -9069,15 +9490,14 @@ var ShadowMindRuntime = class {
         if (command === "status") {
           await this.refresh(ctx);
           ctx.ui.notify(
-            this.statusLines().join("\n"),
-            this.diagnostics.length ? "warning" : "info"
+            this.presenter.statusLines(this.statusSnapshot()).join("\n"),
+            this.presenter.hasDiagnostics(this.usageStore.error) ? "warning" : "info"
           );
         } else if (command === "hide") {
-          this.panelVisible = false;
-          ctx.ui.setWidget("shadow-mind-panel", void 0);
+          this.presenter.hidePanel(ctx);
         } else {
           await this.refresh(ctx);
-          this.panelVisible = !this.panelVisible;
+          this.presenter.togglePanel();
         }
         this.updateStatus(ctx);
       }
@@ -9101,7 +9521,15 @@ var ShadowMindRuntime = class {
     );
   }
   async onHeartbeat(ctx, executedTools) {
+    const startEpoch = this.epoch;
     const snapshot = await this.refresh(ctx);
+    if (startEpoch !== this.epoch || this.shuttingDown) {
+      this.record("heartbeat-skipped", {
+        reason: "superseded",
+        modelCalls: this.modelCalls
+      });
+      return;
+    }
     const config = this.configStore.current;
     if (!shouldEvaluateHeartbeat(executedTools, config.heartbeatTools)) {
       this.record("heartbeat-skipped", {
@@ -9162,13 +9590,14 @@ var ShadowMindRuntime = class {
     }
   }
   async onFinalResponse(ctx) {
+    if (this.shuttingDown) return;
     if (this.batcher.hasPending) {
       await this.batcher.flush();
       return;
     }
     const request = this.completionReview.begin(this.epoch);
     const snapshot = await this.refresh(ctx);
-    if (!this.completionReview.isCurrent(request)) {
+    if (!this.completionReview.isCurrent(request) || this.shuttingDown) {
       this.record("final-response-skipped", { reason: "superseded" });
       return;
     }
@@ -9274,6 +9703,9 @@ var ShadowMindRuntime = class {
           reason: "error",
           error: error instanceof Error ? error.message : String(error)
         });
+        if (this.latestContext && this.sessionLifetime.isActive) {
+          this.updateStatus(this.latestContext);
+        }
       } catch {
       }
     });
@@ -9282,27 +9714,29 @@ var ShadowMindRuntime = class {
     const activeRun = this.active.get(runId);
     this.active.delete(runId);
     this.completionReview.slotAvailable();
-    const persisted = this.usageStore.add(result.usage);
-    if (activeRun?.epoch !== this.epoch) {
-      this.completionReview.complete(activeRun?.completionReview);
-      return;
-    }
-    this.sessionUsage = addUsage(this.sessionUsage, result.usage);
-    this.recentRuns.push({
-      shadowName: shadow.name,
-      completedAt: (/* @__PURE__ */ new Date()).toISOString(),
-      result
-    });
-    if (this.recentRuns.length > 5) this.recentRuns.shift();
-    this.record("run-end", { runId, shadowId: shadow.id, ...result });
-    if (this.latestContext && this.sessionLifetime.isActive)
-      this.updateStatus(this.latestContext);
-    this.completionReview.complete(activeRun.completionReview);
-    void persisted.then(() => {
-      if (this.latestContext && this.sessionLifetime.isActive)
+    try {
+      const persisted = this.usageStore.add(result.usage);
+      if (activeRun?.epoch !== this.epoch) {
+        if (this.latestContext && this.sessionLifetime.isActive) {
+          this.updateStatus(this.latestContext);
+        }
+        return;
+      }
+      this.sessionUsage = addUsage(this.sessionUsage, result.usage);
+      this.presenter.recordRun(shadow.name, result);
+      this.record("run-end", { runId, shadowId: shadow.id, ...result });
+      if (this.latestContext && this.sessionLifetime.isActive) {
         this.updateStatus(this.latestContext);
-    }).catch(() => {
-    });
+      }
+      void persisted.then(() => {
+        if (this.latestContext && this.sessionLifetime.isActive) {
+          this.updateStatus(this.latestContext);
+        }
+      }).catch(() => {
+      });
+    } finally {
+      this.completionReview.complete(activeRun?.completionReview);
+    }
   }
   /** Deliver a report batch and own the returned promise (SessionLifetime.run rethrows non-stale errors). */
   deliverSafely(reports) {
@@ -9352,13 +9786,12 @@ var ShadowMindRuntime = class {
     const config = await this.configStore.reload();
     const registry = await this.registry.load();
     this.batcher.setWindow(config.config.resultBatchWindowMs);
-    this.shadowCount = registry.shadows.length;
-    this.diagnostics = [
+    this.presenter.setRegistrySnapshot(registry.shadows.length, [
       ...config.error ? [`config: ${config.error}`] : [],
       ...registry.diagnostics.map(
         (item) => `${item.filePath}: ${item.message}`
       )
-    ];
+    ]);
     this.updateStatus(ctx);
     return registry;
   }
@@ -9395,8 +9828,7 @@ var ShadowMindRuntime = class {
       epoch: this.epoch,
       data
     };
-    this.recentEvents.push(event);
-    if (this.recentEvents.length > 20) this.recentEvents.shift();
+    this.presenter.recordEvent(event);
     this.sessionLifetime.run(
       () => this.pi.appendEntry("shadow-mind-event", event)
     );
@@ -9412,57 +9844,20 @@ var ShadowMindRuntime = class {
   }
   updateStatus(ctx) {
     this.sessionLifetime.run(() => {
-      const diagnostics = this.usageStore.error ? [...this.diagnostics, `usage: ${this.usageStore.error}`] : this.diagnostics;
-      const warning = diagnostics.length || this.hasRecentRunErrors() ? " !" : "";
-      const usage = `${formatUsageTokens(this.sessionUsage.totalTokens)} \xB7 ${formatUsageCost(this.sessionUsage.cost.total)}`;
-      ctx.ui.setStatus(
-        "shadow-mind",
-        this.paused ? `\u{1F419} Paused \xB7 ${usage}${warning}` : `\u{1F419} ${this.active.size} \xB7 ${usage}${warning}`
-      );
-      if (this.panelVisible)
-        ctx.ui.setWidget("shadow-mind-panel", this.statusLines(), {
-          placement: "aboveEditor"
-        });
+      this.presenter.update(ctx, this.statusSnapshot());
     });
   }
-  hasRecentRunErrors() {
-    return this.recentEvents.slice(-3).some(
-      (event) => event.kind === "run-end" && (event.data?.reason === "error" || event.data?.reason === "timeout")
-    );
-  }
-  statusLines() {
-    const config = this.configStore.current;
-    const diagnostics = this.usageStore.error ? [...this.diagnostics, `usage: ${this.usageStore.error}`] : this.diagnostics;
-    return [
-      `\u{1F419} Shadow Mind \xB7 ${this.paused ? "paused" : "active"} \xB7 running ${this.active.size}/${config.maxParallelShadows}`,
-      `heartbeat ${formatNumber(config.heartbeatProbability)} \xB7 batch ${config.resultBatchWindowMs}ms \xB7 timeout ${config.defaultShadowTimeoutSeconds}s \xB7 drain ${config.headlessDrainTimeoutSeconds}s \xB7 thinking ${config.defaultThinkingLevel}`,
-      `definitions: ${this.shadowCount} valid \xB7 ${this.diagnostics.length} invalid`,
-      formatUsageDetail("session", this.sessionUsage),
-      `usage lifetime \xB7 ${formatUsageSummary(this.usageStore.current)}`,
-      ...this.recentRuns.slice(-3).map(
-        ({ shadowName, completedAt, result }) => `recent run \xB7 ${formatCompletedAt(completedAt)} \xB7 ${shadowName} \xB7 ${result.reason} \xB7 ${formatUsageSummary(result.usage)}`
-      ),
-      ...diagnostics.map((diagnostic) => `diagnostic: ${diagnostic}`),
-      ...this.recentEvents.slice(-5).map((event) => {
-        const failed = event.kind === "run-end" && (event.data?.reason === "error" || event.data?.reason === "timeout");
-        const detail = failed ? ` ${event.data?.error ?? event.data?.reason}` : "";
-        return `${new Date(event.at).toLocaleTimeString("en-GB", { hour12: false })} ${event.kind}${detail}`;
-      }),
-      "Shortcut: Alt+S toggle \xB7 Commands: /shadow toggle | pause | resume | status | hide | reports"
-    ];
+  statusSnapshot() {
+    return {
+      paused: this.paused,
+      activeCount: this.active.size,
+      config: this.configStore.current,
+      sessionUsage: this.sessionUsage,
+      lifetimeUsage: this.usageStore.current,
+      usageError: this.usageStore.error
+    };
   }
 };
-function formatNumber(value) {
-  return Number(value.toFixed(3)).toString();
-}
-function formatCompletedAt(completedAt) {
-  return new Date(completedAt).toLocaleTimeString("en-GB", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23"
-  });
-}
 
 // src/index.ts
 function shadowMindExtension(pi) {

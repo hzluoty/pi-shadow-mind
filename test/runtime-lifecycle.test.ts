@@ -7,15 +7,15 @@ import type { FinalResponseBudget } from "../src/final-response-budget.js";
 import type { ReportBatcher } from "../src/report-batcher.js";
 import { ShadowMindRuntime } from "../src/runtime.js";
 import type { ShadowRunResult } from "../src/shadow-runner.js";
+import type { StatusPresenter } from "../src/status-presenter.js";
 import type { RegistrySnapshot, ShadowDefinition } from "../src/types.js";
 import { zeroUsage, type ShadowUsage } from "../src/usage.js";
 
 type EventHandler = (event: unknown, context: ExtensionContext) => unknown;
 
 interface RuntimeInternals {
-  active: Map<string, { shadow: ShadowDefinition; epoch: number }>;
+  active: Map<string, { shadow: ShadowDefinition; epoch: number; completionReview?: { accept: (r: unknown) => void } }>;
   epoch: number;
-  recentRuns: unknown[];
   sessionUsage: ShadowUsage;
   usageStore: {
     add: (usage: ShadowUsage) => Promise<void>;
@@ -23,6 +23,7 @@ interface RuntimeInternals {
   completionReview: {
     schedule: (...args: unknown[]) => boolean;
     invalidate: () => void;
+    complete: (run?: unknown) => void;
   };
   runner: {
     run: (...args: unknown[]) => Promise<ShadowRunResult>;
@@ -36,7 +37,10 @@ interface RuntimeInternals {
     ctx: ExtensionContext,
     executedTools: ReadonlySet<string>,
   ) => Promise<void>;
-  recentEvents: Array<{ kind: string; data?: Record<string, unknown> }>;
+  presenter: StatusPresenter;
+  sessionLifetime: { activate: () => void; deactivate: () => void; isActive: boolean };
+  latestContext?: ExtensionContext;
+  updateStatus: (ctx: ExtensionContext) => void;
   handleRunEnd: (
     runId: string,
     shadow: ShadowDefinition,
@@ -69,6 +73,7 @@ function createRuntimeHarness() {
       handlers.set(name, handler);
     },
     getAllTools: () => [],
+    appendEntry: vi.fn(),
   } as unknown as ExtensionAPI);
   const internals = runtime as unknown as RuntimeInternals;
   return { handlers, internals };
@@ -128,14 +133,59 @@ describe("ShadowMindRuntime session lifecycle", () => {
     await agentEnd!(
       {
         messages: [
+          { role: "assistant", stopReason: "aborted", content: [{ type: "text", text: "partial" }] },
+        ],
+      },
+      context,
+    );
+    await agentSettled!({ aborted: true }, context);
+    expect(internals.refresh).not.toHaveBeenCalled();
+
+    await agentEnd!(
+      {
+        messages: [
           { role: "assistant", content: [{ type: "text", text: "Done." }] },
         ],
       },
       context,
     );
     expect(internals.refresh).not.toHaveBeenCalled();
-    await agentSettled!({}, context);
+    await agentSettled!({ aborted: false }, context);
     expect(internals.refresh).toHaveBeenCalledOnce();
+  });
+
+  it("aborts running shadows and bumps epoch on aborted agent_settled", async () => {
+    const { handlers, internals } = createRuntimeHarness();
+    internals.refresh = vi.fn().mockResolvedValue({
+      shadows: [],
+      diagnostics: [],
+    });
+    internals.active.set("hb-run", { shadow, epoch: 0 });
+    internals.registerEvents();
+    const context = {} as ExtensionContext;
+
+    await handlers.get("agent_end")!(
+      {
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "Done." }] },
+        ],
+      },
+      context,
+    );
+    await handlers.get("agent_settled")!({ aborted: true }, context);
+
+    expect(internals.epoch).toBe(1);
+    expect(internals.refresh).not.toHaveBeenCalled();
+    expect(
+      internals.presenter.recentEvents.some(
+        (event) =>
+          event.kind === "runs-aborted" && event.data?.reason === "user-aborted",
+      ),
+    ).toBe(true);
+    expect(internals.presenter.recentEvents.at(-1)).toMatchObject({
+      kind: "final-response-skipped",
+      data: { reason: "aborted" },
+    });
   });
 
   it("does not consume a round for an invalidated queued final review", async () => {
@@ -168,7 +218,7 @@ describe("ShadowMindRuntime session lifecycle", () => {
     internals.completionReview.invalidate();
     await internals.onFinalResponse(context);
 
-    expect(internals.recentEvents.at(-1)?.data?.activated).toEqual([
+    expect(internals.presenter.recentEvents.at(-1)?.data?.activated).toEqual([
       finalShadow.id,
     ]);
   });
@@ -204,7 +254,7 @@ describe("ShadowMindRuntime session lifecycle", () => {
     internals.completionReview.invalidate();
     await internals.onFinalResponse(context);
 
-    expect(internals.recentEvents.at(-1)?.data?.activated).toEqual([
+    expect(internals.presenter.recentEvents.at(-1)?.data?.activated).toEqual([
       finalShadow.id,
     ]);
   });
@@ -353,7 +403,122 @@ describe("ShadowMindRuntime session lifecycle", () => {
 
     expect(persisted).toEqual([usage]);
     expect(internals.sessionUsage).toEqual(zeroUsage());
-    expect(internals.recentRuns).toHaveLength(0);
+    expect(internals.presenter.recentRuns).toHaveLength(0);
+  });
+
+  it("updates status when a stale run finishes and still completes CompletionReview if recording throws", () => {
+    const { internals } = createRuntimeHarness();
+    internals.sessionLifetime.activate();
+    const setStatus = vi.fn();
+    const context = {
+      ui: { setStatus, setWidget: vi.fn() },
+    } as unknown as ExtensionContext;
+    internals.latestContext = context;
+    internals.epoch = 2;
+    const review = { accept: vi.fn() };
+    const completeSpy = vi.spyOn(internals.completionReview, "complete");
+    internals.usageStore.add = vi.fn().mockResolvedValue(undefined);
+    internals.active.set("old-run", { shadow, epoch: 1, completionReview: review });
+
+    internals.handleRunEnd("old-run", shadow, runResult(zeroUsage()));
+    expect(setStatus).toHaveBeenCalled();
+    expect(completeSpy).toHaveBeenCalledWith(review);
+
+    const recordRunSpy = vi.spyOn(internals.presenter, "recordRun").mockImplementationOnce(() => {
+      throw new Error("presenter boom");
+    });
+    internals.active.set("cur-run", { shadow, epoch: 2, completionReview: review });
+    expect(() => internals.handleRunEnd("cur-run", shadow, runResult(zeroUsage()))).toThrow("presenter boom");
+    expect(completeSpy).toHaveBeenCalledTimes(2);
+    recordRunSpy.mockRestore();
+  });
+
+  it("abandons an in-flight heartbeat superseded by new input or shutdown during refresh", async () => {
+    const { handlers, internals } = createRuntimeHarness();
+    let finishRefresh: ((snapshot: RegistrySnapshot) => void) | undefined;
+    internals.refresh = vi.fn(
+      () =>
+        new Promise<RegistrySnapshot>((resolve) => {
+          finishRefresh = resolve;
+        }),
+    );
+    internals.runner.run = vi.fn();
+    internals.registerEvents();
+    const context = {
+      model: { provider: "openai", id: "gpt" },
+    } as ExtensionContext;
+
+    const pendingTurn = handlers.get("turn_end")!(
+      { toolResults: [{ toolName: "read" }] },
+      context,
+    ) as Promise<void>;
+    handlers.get("input")!({ source: "interactive" }, context);
+    finishRefresh!({ shadows: [shadow], diagnostics: [] });
+    await pendingTurn;
+
+    expect(internals.runner.run).not.toHaveBeenCalled();
+    expect(internals.presenter.recentEvents.at(-1)).toMatchObject({
+      kind: "heartbeat-skipped",
+      data: { reason: "superseded" },
+    });
+
+    // Also test shutdown during refresh while epoch has not yet incremented (e.g. headless drain).
+    const pendingShutdownTurn = handlers.get("turn_end")!(
+      { toolResults: [{ toolName: "read" }] },
+      context,
+    ) as Promise<void>;
+    const shutdownPromise = handlers.get("session_shutdown")!(
+      { reason: "quit" },
+      { mode: "interactive", ui: { setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext,
+    ) as Promise<void>;
+    finishRefresh!({ shadows: [shadow], diagnostics: [] });
+    await pendingShutdownTurn;
+    await shutdownPromise;
+    expect(internals.runner.run).not.toHaveBeenCalled();
+  });
+
+  it("aborts running shadows and refreshes status on session_tree and input", () => {
+    const { handlers, internals } = createRuntimeHarness();
+    internals.sessionLifetime.activate();
+    const setStatus = vi.fn();
+    const context = {
+      ui: { setStatus, setWidget: vi.fn() },
+    } as unknown as ExtensionContext;
+    internals.registerEvents();
+
+    internals.active.set("branch-run", { shadow, epoch: 0 });
+    handlers.get("session_tree")!({}, context);
+    expect(internals.epoch).toBe(1);
+    expect(internals.presenter.recentEvents.at(-1)).toMatchObject({
+      kind: "runs-aborted",
+      data: { reason: "session-tree" },
+    });
+    expect(setStatus).toHaveBeenCalled();
+
+    setStatus.mockClear();
+    handlers.get("input")!({ source: "interactive" }, context);
+    expect(internals.epoch).toBe(2);
+    expect(setStatus).toHaveBeenCalledOnce();
+  });
+
+  it("clears previous session events and diagnostics on session_start", async () => {
+    const { handlers, internals } = createRuntimeHarness();
+    internals.registerEvents();
+    internals.presenter.recordEvent({ at: new Date().toISOString(), kind: "run-end", epoch: 0, data: { reason: "error" } });
+    internals.presenter.recordRun(shadow.name, runResult(zeroUsage()));
+    expect(internals.presenter.recentEvents).toHaveLength(1);
+
+    (internals as unknown as { configStore: { initialize: () => Promise<void> } }).configStore.initialize = vi.fn().mockResolvedValue(undefined);
+    (internals as unknown as { usageStore: { initialize: () => Promise<void> } }).usageStore.initialize = vi.fn().mockResolvedValue(undefined);
+    (internals as unknown as { registry: { initialize: () => Promise<void> } }).registry.initialize = vi.fn().mockResolvedValue(undefined);
+    internals.refresh = vi.fn().mockResolvedValue({ shadows: [], diagnostics: [] });
+
+    await handlers.get("session_start")!(
+      { reason: "new" },
+      { ui: { setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext,
+    );
+    expect(internals.presenter.recentRuns).toHaveLength(0);
+    expect(internals.presenter.recentEvents.map((e) => e.kind)).toEqual(["session-config"]);
   });
 
   it("skips text-only turns and forwards completed tool names for refreshed evaluation", async () => {
@@ -365,7 +530,7 @@ describe("ShadowMindRuntime session lifecycle", () => {
 
     await turnEnd({ toolResults: [] }, context);
     expect(internals.onHeartbeat).not.toHaveBeenCalled();
-    expect(internals.recentEvents.at(-1)?.data?.reason).toBe(
+    expect(internals.presenter.recentEvents.at(-1)?.data?.reason).toBe(
       "no-tool-activity",
     );
 

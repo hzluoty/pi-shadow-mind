@@ -10,10 +10,6 @@ const KICKOFF = `First decide whether the trajectory is relevant to this Shadow 
 If it is unrelated, reply exactly NOT_RELEVANT and stop immediately. Do not call any tool, including report_to_main.
 If it is relevant, perform the Shadow Mind's responsibility now. Call report_to_main only when the main agent should receive a result.`;
 
-export function buildShadowSystemPrompt(mainSystemPrompt: string): string {
-  return mainSystemPrompt;
-}
-
 export function buildShadowRequest(trajectory: string, shadow: ShadowDefinition): string {
   return `${trajectory}\n\n${RUNTIME_PROTOCOL}\n\n<shadow-mind id="${shadow.id}" name="${shadow.name}">\n${shadow.prompt}\n</shadow-mind>\n\n${KICKOFF}`;
 }

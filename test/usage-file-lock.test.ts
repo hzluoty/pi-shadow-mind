@@ -74,6 +74,25 @@ describe("usage file lock", () => {
     expect(owner.token).not.toBe("dead");
     await release();
   });
+
+  it("times out with an explicit error instead of hanging forever on a live contended lock", async () => {
+    const release = await acquireUsageFileLock(usagePath, TIMING);
+    await expect(
+      acquireUsageFileLock(usagePath, { ...TIMING, acquireTimeoutMs: 40 }),
+    ).rejects.toThrow(/timed out acquiring usage file lock/);
+    await release();
+  });
+
+  it("handles rapid sequential lock handoffs without deleting the next holder's lock files", async () => {
+    for (let i = 0; i < 10; i += 1) {
+      const first = await acquireUsageFileLock(usagePath, TIMING);
+      const secondPromise = acquireUsageFileLock(usagePath, { ...TIMING, acquireTimeoutMs: 2_000 });
+      await delay(2);
+      await first();
+      const second = await secondPromise;
+      await second();
+    }
+  });
 });
 
 function delay(ms: number): Promise<void> {

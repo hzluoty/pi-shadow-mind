@@ -11,6 +11,7 @@ export function serializeTrajectory(messages: readonly MessageLike[]): string {
   }
 
   const lines: string[] = [];
+  const matchedToolCallIds = new Set<string>();
   for (const message of messages) {
     if (message.role === "user") {
       appendText(lines, "USER", message.content);
@@ -28,13 +29,14 @@ export function serializeTrajectory(messages: readonly MessageLike[]): string {
         if (item.type === "toolCall" && item.name) {
           const call = `${item.name}(${compactJson(item.arguments)})`;
           const result = item.id ? results.get(item.id) : undefined;
+          if (item.id && result !== undefined) matchedToolCallIds.add(item.id);
           lines.push(`TOOL: ${call}${result ? ` · ${result}` : ""}`);
         }
       }
       continue;
     }
     if (message.role === "toolResult") {
-      if (typeof message.toolCallId !== "string" || !results.has(message.toolCallId)) {
+      if (typeof message.toolCallId !== "string" || !matchedToolCallIds.has(message.toolCallId)) {
         lines.push(`TOOL RESULT: ${summarizeToolResult(message)}`);
       }
       continue;
@@ -50,38 +52,8 @@ export function serializeTrajectory(messages: readonly MessageLike[]): string {
   return `<main-agent-trajectory>\n${lines.join("\n")}\n</main-agent-trajectory>`;
 }
 
-export function sanitizeTrajectory(messages: readonly MessageLike[]): MessageLike[] {
-  return messages.flatMap((message) => {
-    if (message.role === "assistant") {
-      const content = Array.isArray(message.content)
-        ? message.content.filter((block) => !isThinkingBlock(block)).map(clone)
-        : message.content;
-      return [{ ...clone(message), content }];
-    }
-    if (message.role === "toolResult") {
-      return [{
-        ...clone(message),
-        content: [{ type: "text", text: summarizeToolResult(message) }],
-        details: undefined,
-        usage: undefined,
-      }];
-    }
-    if (message.role === "custom") {
-      return message.customType === "shadow-report" ? [clone(message)] : [];
-    }
-    if (message.role === "user" || message.role === "compactionSummary" || message.role === "branchSummary") {
-      return [clone(message)];
-    }
-    return [];
-  });
-}
-
 function isThinkingBlock(value: unknown): boolean {
   return Boolean(value) && typeof value === "object" && (value as { type?: string }).type === "thinking";
-}
-
-function clone<T>(value: T): T {
-  return structuredClone(value);
 }
 
 function appendText(lines: string[], label: string, content: unknown): void {

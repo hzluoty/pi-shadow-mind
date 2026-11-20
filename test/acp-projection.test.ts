@@ -142,11 +142,28 @@ describe("buildShadowSessionContext", () => {
     expect(text).not.toContain("report-s");
   });
 
-  it("strips orphaned calls/results across compression boundaries", () => {
+  it("strips orphaned calls/results across compression boundaries while keeping assistant text", () => {
     const entries = [user("root"), assistant("a", ["c1", "c2"]), result("r1", "c1"), result("r2", "c2")];
     const text = trajectory(entries, [block(["a#c1", "r2"])]);
     expect(text).not.toContain("COMMAND_");
     expect(text).not.toContain("TOOL RESULT:");
+    expect(text).toContain("MAIN: text-a");
+  });
+
+  it("drops an assistant message completely if only orphaned tool calls remain without text", () => {
+    const toolOnlyAssistant: SessionEntry = entry("a", {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "COMMAND_c1" } }],
+      api: "openai-completions",
+      provider: "openai",
+      model: "test",
+      stopReason: "stop",
+      timestamp: 0,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    });
+    const text = trajectory([user("root"), toolOnlyAssistant, result("r1", "c1")], [block(["r1"])]);
+    expect(text).not.toContain("COMMAND_c1");
+    expect(text).not.toContain("MAIN:");
   });
 
   it("does not let an inactive branch consume the summary anchor", () => {

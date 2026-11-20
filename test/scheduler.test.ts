@@ -89,15 +89,35 @@ describe("shouldEvaluateFinalResponse", () => {
     expect(
       shouldEvaluateFinalResponse([
         { role: "user", content: "task" },
-        { role: "assistant", content: [{ type: "text", text: "Done." }] },
+        { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Done." }] },
+      ]),
+    ).toBe(true);
+    expect(
+      shouldEvaluateFinalResponse([
+        { role: "assistant", stopReason: "length", content: [{ type: "text", text: "Truncated" }] },
       ]),
     ).toBe(true);
   });
 
-  it("rejects tool-only, empty, and aborted endings", () => {
+  it("rejects tool-only, empty, and aborted/errored endings even with partial text", () => {
     expect(
       shouldEvaluateFinalResponse([
         { role: "assistant", content: [{ type: "toolCall", name: "read" }] },
+      ]),
+    ).toBe(false);
+    expect(
+      shouldEvaluateFinalResponse([
+        { role: "assistant", stopReason: "aborted", content: [{ type: "text", text: "partial text" }] },
+      ]),
+    ).toBe(false);
+    expect(
+      shouldEvaluateFinalResponse([
+        { role: "assistant", stopReason: "error", content: [{ type: "text", text: "partial text" }] },
+      ]),
+    ).toBe(false);
+    expect(
+      shouldEvaluateFinalResponse([
+        { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "calling tool" }] },
       ]),
     ).toBe(false);
     expect(
@@ -301,11 +321,19 @@ describe("matchesModel", () => {
     expect(matchesModel(s, "anthropic/claude-3-7-sonnet")).toBe(false);
   });
 
-  it("matches model ID without provider prefix", () => {
+  it("matches model ID without provider prefix including slash-containing bare model IDs", () => {
     const s = { ...shadow("s"), activeForModels: ["gpt-6-astra"] };
     expect(matchesModel(s, "openai-codex/gpt-6-astra")).toBe(true);
     expect(matchesModel(s, "custom-provider/gpt-6-astra")).toBe(true);
     expect(matchesModel(s, "openai-codex/gpt-5.5")).toBe(false);
+
+    const slashBare = { ...shadow("s"), activeForModels: ["vendor/fast-model"] };
+    expect(matchesModel(slashBare, "openrouter/vendor/fast-model")).toBe(true);
+    expect(matchesModel(slashBare, "openrouter/vendor/other")).toBe(false);
+
+    const slashExcluded = { ...shadow("s"), activeForModels: ["*", "!vendor/fast-model"] };
+    expect(matchesModel(slashExcluded, "openrouter/vendor/fast-model")).toBe(false);
+    expect(matchesModel(slashExcluded, "openrouter/vendor/other")).toBe(true);
   });
 
   it("supports wildcard patterns", () => {

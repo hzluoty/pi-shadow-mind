@@ -1,14 +1,25 @@
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { access, readFile, unlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import YAML from "yaml";
-import { serializeConfig } from "./config.js";
+import { DEFAULT_CONFIG, parseConfig, serializeConfig } from "./config.js";
 import { parseShadowMarkdown, ShadowRegistry } from "./registry.js";
 import type { ShadowConfig, ShadowDefinition } from "./types.js";
+import { SHADOW_ID_PATTERN } from "./validation.js";
 
 export type ShadowDraft = Partial<Omit<ShadowDefinition, "filePath">> & {
   id: string;
   prompt?: string;
 };
+
+export interface PreparedShadowWrite {
+  definition: ShadowDefinition;
+  source: string;
+  filePath: string;
+}
+
+export interface PreparedShadowUpdate extends PreparedShadowWrite {
+  current: ShadowDefinition;
+}
 
 export class EntityStore {
   constructor(
@@ -26,48 +37,66 @@ export class EntityStore {
     return shadow;
   }
 
-  async create(draft: ShadowDraft): Promise<ShadowDefinition> {
-    if ((await this.list()).some((shadow) => shadow.id === draft.id))
+  async previewCreate(draft: ShadowDraft): Promise<PreparedShadowWrite> {
+    if (!SHADOW_ID_PATTERN.test(draft.id)) {
+      throw new Error("id must match [a-z0-9][a-z0-9_-]*");
+    }
+    if ((await this.list()).some((shadow) => shadow.id === draft.id)) {
       throw new Error(`shadow already exists: ${draft.id}`);
-    return this.writeParsed(
-      join(this.registry.directory, `${draft.id}.md`),
-      draft,
-      { overwrite: false },
-    );
+    }
+    const filePath = join(this.registry.directory, `${draft.id}.md`);
+    if (await pathExists(filePath)) {
+      throw new Error(`shadow file already exists: ${filePath}`);
+    }
+    const source = serializeShadow({
+      ...draft,
+      prompt: draft.prompt ?? "Describe this Shadow Mind's responsibility.",
+    });
+    const definition = parseShadowMarkdown(source, filePath);
+    return { definition, source, filePath };
+  }
+
+  async commitCreate(prepared: PreparedShadowWrite): Promise<ShadowDefinition> {
+    await writeFile(prepared.filePath, prepared.source, {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    this.registry.invalidate(prepared.filePath);
+    return prepared.definition;
+  }
+
+  async create(draft: ShadowDraft): Promise<ShadowDefinition> {
+    const prepared = await this.previewCreate(draft);
+    return this.commitCreate(prepared);
+  }
+
+  async previewUpdate(
+    id: string,
+    patch: Partial<Omit<ShadowDraft, "id">>,
+  ): Promise<PreparedShadowUpdate> {
+    const current = await this.get(id);
+    const source = serializeShadow({
+      ...current,
+      ...definedOnly(patch),
+      id,
+      prompt: patch.prompt ?? current.prompt,
+    });
+    const definition = parseShadowMarkdown(source, current.filePath);
+    return { current, definition, source, filePath: current.filePath };
+  }
+
+  async commitUpdate(prepared: PreparedShadowUpdate): Promise<ShadowDefinition> {
+    await writeFile(prepared.filePath, prepared.source, { encoding: "utf8" });
+    this.registry.invalidate(prepared.filePath);
+    return prepared.definition;
   }
 
   async update(
     id: string,
     patch: Partial<Omit<ShadowDraft, "id">>,
   ): Promise<ShadowDefinition> {
-    const current = await this.get(id);
-    return this.writeParsed(
-      current.filePath,
-      {
-        ...current,
-        ...definedOnly(patch),
-        id,
-        prompt: patch.prompt ?? current.prompt,
-      },
-      { overwrite: true },
-    );
-  }
-
-  private async writeParsed(
-    filePath: string,
-    draft: ShadowDraft,
-    options: { overwrite: boolean },
-  ): Promise<ShadowDefinition> {
-    const source = serializeShadow({
-      ...draft,
-      prompt: draft.prompt ?? "Describe this Shadow Mind's responsibility.",
-    });
-    const parsed = parseShadowMarkdown(source, filePath);
-    await writeFile(filePath, source, {
-      encoding: "utf8",
-      ...(options.overwrite ? {} : { flag: "wx" }),
-    });
-    return parsed;
+    const prepared = await this.previewUpdate(id, patch);
+    return this.commitUpdate(prepared);
   }
 
   async setEnabled(id: string, enabled: boolean): Promise<ShadowDefinition> {
@@ -75,15 +104,41 @@ export class EntityStore {
   }
 
   async delete(id: string): Promise<void> {
-    await unlink((await this.get(id)).filePath);
+    const filePath = (await this.get(id)).filePath;
+    await unlink(filePath);
+    this.registry.invalidate(filePath);
   }
 
   async readConfig(): Promise<string> {
     return readFile(this.configPath, "utf8");
   }
 
+  async readParsedConfig(fallback: ShadowConfig = DEFAULT_CONFIG): Promise<ShadowConfig> {
+    try {
+      const raw = await readFile(this.configPath, "utf8");
+      return parseConfig(JSON.parse(raw));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return fallback;
+      }
+      throw new Error(
+        `cannot read current config (${this.configPath}): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
   async writeConfig(config: ShadowConfig): Promise<void> {
     await writeFile(this.configPath, serializeConfig(config), "utf8");
+  }
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
   }
 }
 

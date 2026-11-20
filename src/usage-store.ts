@@ -18,16 +18,19 @@ export class UsageStore {
   private lifetime = zeroUsage();
   private pendingUsage = zeroUsage();
   private lastError?: string;
-  private initialization?: Promise<void>;
   private pendingWrite: Promise<void> = Promise.resolve();
 
   constructor(agentDir: string) {
     this.usagePath = join(agentDir, "shadow-minds", "usage.json");
   }
 
-  initialize(): Promise<void> {
-    this.initialization ??= this.load();
-    return this.initialization;
+  async initialize(): Promise<void> {
+    const reload = this.pendingWrite.then(
+      () => this.load(),
+      () => this.load(),
+    );
+    this.pendingWrite = reload;
+    await reload;
   }
 
   get current(): ShadowUsage {
@@ -70,15 +73,15 @@ export class UsageStore {
   private async load(): Promise<void> {
     try {
       const raw = await readFile(this.usagePath, "utf8");
-      this.lifetime = parseUsageDocument(JSON.parse(raw)).lifetime;
+      this.lifetime = addUsage(parseUsageDocument(JSON.parse(raw)).lifetime, this.pendingUsage);
       this.lastError = undefined;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        this.lifetime = zeroUsage();
+        this.lifetime = addUsage(zeroUsage(), this.pendingUsage);
         this.lastError = undefined;
         return;
       }
-      this.lifetime = zeroUsage();
+      this.lifetime = addUsage(zeroUsage(), this.pendingUsage);
       this.lastError = error instanceof Error ? error.message : String(error);
     }
   }

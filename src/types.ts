@@ -1,6 +1,6 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 
-export const DEFAULT_READ_TOOLS = ["read", "ffgrep", "fffind"] as const;
+export const DEFAULT_READ_TOOLS = ["read", "grep", "find", "ls"] as const;
 
 export interface ShadowConfig {
   heartbeatProbability: number;

@@ -1,17 +1,23 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SELF_PATH = normalize(resolve(fileURLToPath(import.meta.url)));
-const SELF_DIRECTORY = dirname(SELF_PATH);
+const SELF_PATH = canonicalPath(fileURLToPath(import.meta.url));
+const SELF_FALLBACK_PATH = normalizeCase(normalize(resolve(fileURLToPath(import.meta.url))));
+const SELF_DIRECTORIES = new Set([dirname(SELF_PATH), dirname(SELF_FALLBACK_PATH)]);
 const SELF_ENTRIES = new Set(["index.ts", "index.js"]);
 
 /** This plugin's own extension entry, which a Shadow session must never load. */
 export function isSelfExtension(candidate: string): boolean {
-  const normalized = normalize(resolve(candidate));
-  if (normalized === SELF_PATH) return true;
-  return dirname(normalized) === SELF_DIRECTORY && SELF_ENTRIES.has(basename(normalized));
+  if (isVirtualExtensionPath(candidate)) return false;
+  const fallback = normalizeCase(normalize(resolve(candidate)));
+  const canonical = canonicalPath(candidate);
+  if (fallback === SELF_FALLBACK_PATH || canonical === SELF_PATH) return true;
+  return (
+    (SELF_ENTRIES.has(basename(fallback)) && SELF_DIRECTORIES.has(dirname(fallback))) ||
+    (SELF_ENTRIES.has(basename(canonical)) && SELF_DIRECTORIES.has(dirname(canonical)))
+  );
 }
 
 /** Directories to inspect above an extension file when looking for its package root. */
@@ -37,13 +43,18 @@ const packageNameCache = new Map<string, { name: string; directory: string } | u
  * becomes a name, so one generic entry cannot wipe out every packaged extension.
  */
 export function extensionIdentifiers(resolvedPath: string): Set<string> {
-  const normalized = normalize(resolve(resolvedPath));
-  const identifiers = new Set([normalized]);
-  const owner = findPackage(dirname(normalized));
+  if (isVirtualExtensionPath(resolvedPath)) {
+    return new Set([resolvedPath, stripScheme(resolvedPath)]);
+  }
+  const normalized = normalizeCase(normalize(resolve(resolvedPath)));
+  const canonical = canonicalPath(resolvedPath);
+  const identifiers = new Set([normalized, canonical]);
+  const owner = findPackage(dirname(canonical)) ?? findPackage(dirname(normalized));
   if (owner) {
     identifiers.add(owner.name);
     identifiers.add(basename(owner.directory));
     identifiers.add(owner.directory);
+    identifiers.add(normalizeCase(owner.directory));
   }
   const fileName = basename(normalized);
   if (!GENERIC_ENTRY_FILE.test(fileName)) {
@@ -65,7 +76,11 @@ export function createExtensionExcluder(entries: readonly string[]): (resolvedPa
     if (!trimmed) continue;
     wanted.add(trimmed);
     wanted.add(stripScheme(trimmed));
-    wanted.add(normalize(resolve(expandHome(trimmed))));
+    if (looksLikePath(trimmed)) {
+      const expanded = expandHome(trimmed);
+      wanted.add(normalizeCase(normalize(resolve(expanded))));
+      wanted.add(canonicalPath(expanded));
+    }
   }
   if (wanted.size === 0) return () => false;
   return (resolvedPath) => {
@@ -83,11 +98,11 @@ export function createExtensionExcluder(entries: readonly string[]): (resolvedPa
  */
 function findPackage(directory: string): { name: string; directory: string } | undefined {
   if (packageNameCache.has(directory)) return packageNameCache.get(directory);
-  const home = resolve(homedir());
+  const home = canonicalPath(homedir());
   let current = directory;
   let found: { name: string; directory: string } | undefined;
   for (let depth = 0; depth < PACKAGE_LOOKUP_DEPTH; depth += 1) {
-    if (basename(current) === "node_modules" || current === home) break;
+    if (basename(current) === "node_modules" || normalizeCase(current) === home) break;
     const name = readPackageName(current);
     if (name) {
       found = { name, directory: current };
@@ -112,9 +127,46 @@ function readPackageName(directory: string): string | undefined {
 }
 
 function stripScheme(source: string): string {
+  if (/^[a-zA-Z]:[\\/]/.test(source)) return source;
   return source.replace(/^[a-z][a-z0-9+.-]+:/i, "");
 }
 
 function expandHome(entry: string): string {
-  return entry === "~" || entry.startsWith("~/") ? resolve(homedir(), entry.slice(2)) : entry;
+  return entry === "~" || entry.startsWith("~/") || entry.startsWith("~\\")
+    ? resolve(homedir(), entry.slice(2))
+    : entry;
+}
+
+function isVirtualExtensionPath(path: string): boolean {
+  if (path.startsWith("<") && path.endsWith(">")) return true;
+  if (/^[a-zA-Z]:[\\/]/.test(path)) return false;
+  return /^[a-z][a-z0-9+.-]*:/i.test(path);
+}
+
+function looksLikePath(entry: string): boolean {
+  if (entry.startsWith("@")) return false;
+  return (
+    entry === "~" ||
+    entry.startsWith("~/") ||
+    entry.startsWith("~\\") ||
+    entry.startsWith(".") ||
+    /^[a-zA-Z]:[\\/]/.test(entry) ||
+    entry.includes("/") ||
+    entry.includes("\\")
+  );
+}
+
+function canonicalPath(filePath: string): string {
+  const resolved = normalize(resolve(filePath));
+  let target = resolved;
+  try {
+    target = realpathSync(resolved);
+  } catch {
+    // Non-existent path in unit tests or deleted locations keeps the resolved path.
+  }
+  return normalizeCase(normalize(target));
+}
+
+function normalizeCase(filePath: string): string {
+  return process.platform === "win32" ? filePath.toLowerCase() : filePath;
 }

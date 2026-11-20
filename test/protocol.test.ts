@@ -1,8 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  buildShadowRequest,
-  buildShadowSystemPrompt,
-} from "../src/protocol.js";
+import { buildShadowRequest } from "../src/protocol.js";
 import type { ShadowDefinition } from "../src/types.js";
 
 describe("Shadow runtime protocol", () => {
@@ -20,8 +17,6 @@ describe("Shadow runtime protocol", () => {
       prompt: "Review progress.",
       filePath: "reviewer.md",
     };
-    const prompt = buildShadowSystemPrompt("main system");
-    expect(prompt).toBe("main system");
     const request = buildShadowRequest(
       "<main-agent-trajectory>\nUSER: task\n</main-agent-trajectory>",
       shadow,

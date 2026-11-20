@@ -28,4 +28,16 @@ describe("summarizeToolResult", () => {
     expect(summarizeToolResult({ toolName: "custom-tool", content: undefined })).toBe("no output");
     expect(summarizeToolResult({ toolName: "custom-tool", content: null })).toBe("null");
   });
+
+  it("truncates oversized single-line previews to stay bounded", () => {
+    const huge = `${"A".repeat(50_000)}TAIL_SECRET`;
+    const summary = summarizeToolResult({
+      toolName: "read",
+      content: [{ type: "text", text: huge }],
+      isError: false,
+    });
+    expect(summary.length).toBeLessThanOrEqual(135);
+    expect(summary).toMatch(/^1 read · A+…$/);
+    expect(summary).not.toContain("TAIL_SECRET");
+  });
 });

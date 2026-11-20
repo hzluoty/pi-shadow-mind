@@ -2,7 +2,16 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ShadowConfig } from "./types.js";
-import { cleanStringArray, inRange, isFiniteNumber, isNonEmptyString, isThinkingLevel } from "./validation.js";
+import {
+  cleanStringArray,
+  isFiniteNumber,
+  isThinkingLevel,
+  nonNegativeInteger,
+  numberInRange,
+  optionalNonEmptyString,
+  positiveInteger,
+  positiveNumber,
+} from "./validation.js";
 
 /**
  * Extensions that record or archive whole sessions turn every Shadow run into a
@@ -85,7 +94,14 @@ export class ConfigStore {
       await readFile(this.configPath, "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      await writeFile(this.configPath, serializeConfig(DEFAULT_CONFIG), "utf8");
+      try {
+        await writeFile(this.configPath, serializeConfig(DEFAULT_CONFIG), {
+          encoding: "utf8",
+          flag: "wx",
+        });
+      } catch (writeError) {
+        if ((writeError as NodeJS.ErrnoException).code !== "EEXIST") throw writeError;
+      }
     }
     await this.reload();
   }
@@ -108,36 +124,6 @@ export class ConfigStore {
   get error(): string | undefined {
     return this.lastError;
   }
-}
-
-function numberInRange(value: unknown, min: number, max: number, fallback: number, name: string): number {
-  if (value === undefined) return fallback;
-  if (!isFiniteNumber(value) || !inRange(value, min, max)) throw new Error(`${name} must be between ${min} and ${max}`);
-  return value;
-}
-
-function positiveNumber(value: unknown, fallback: number, name: string): number {
-  if (value === undefined) return fallback;
-  if (!isFiniteNumber(value) || value <= 0) throw new Error(`${name} must be positive`);
-  return value;
-}
-
-function positiveInteger(value: unknown, fallback: number, name: string): number {
-  const parsed = positiveNumber(value, fallback, name);
-  if (!Number.isInteger(parsed)) throw new Error(`${name} must be an integer`);
-  return parsed;
-}
-
-function nonNegativeInteger(value: unknown, fallback: number, name: string): number {
-  if (value === undefined) return fallback;
-  if (!isFiniteNumber(value) || !Number.isInteger(value) || value < 0) throw new Error(`${name} must be a non-negative integer`);
-  return value;
-}
-
-function optionalNonEmptyString(value: unknown, name: string): string | undefined {
-  if (value === undefined) return undefined;
-  if (!isNonEmptyString(value)) throw new Error(`${name} must be a non-empty string`);
-  return value.trim();
 }
 
 function optionalSeed(value: unknown): number | undefined {

@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896644e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline --ignore-scripts --no-audit --no-fund
+
+      - name: Verify types and tests
+        run: npm run verify
+
+      - name: Build and verify committed dist is up to date
+        run: |
+          npm run build
+          git diff --exit-code dist/
+
+      - name: Smoke-test packaged standalone bundle
+        run: |
+          set -euo pipefail
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          tarball="$(npm pack --ignore-scripts --pack-destination "$tmp_dir" | tail -n 1)"
+          standalone="$tmp_dir/standalone"
+          mkdir -p "$standalone"
+          tar -xzf "$tmp_dir/$tarball" --strip-components=1 -C "$standalone"
+          node scripts/smoke-standalone.mjs "$standalone"

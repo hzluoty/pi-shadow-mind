@@ -7,6 +7,7 @@ import { ConfigStore, DEFAULT_CONFIG } from "../src/config.js";
 import { EntityStore } from "../src/entity-store.js";
 import { ShadowRegistry } from "../src/registry.js";
 import { ShadowMindRuntime } from "../src/runtime.js";
+import type { StatusPresenter } from "../src/status-presenter.js";
 import type { ShadowConfig } from "../src/types.js";
 
 const dirs: string[] = [];
@@ -17,7 +18,7 @@ interface Internals {
   random: () => number;
   updateStatus: () => void;
   registerEvents: () => void;
-  recentEvents: Array<{ kind: string; data?: Record<string, unknown> }>;
+  presenter: StatusPresenter;
 }
 
 afterEach(async () => {
@@ -66,11 +67,11 @@ describe("heartbeat configuration refresh", () => {
     // Same write path as update_shadow_config; the in-memory snapshot is still old.
     await h.save({ heartbeatTools: newTools });
     await h.turn(["read"]);
-    expect(h.internals.recentEvents.at(-1)?.kind).toBe(expectedKind);
+    expect(h.internals.presenter.recentEvents.at(-1)?.kind).toBe(expectedKind);
     expect(h.configStore.current.heartbeatTools).toEqual(newTools);
     expect(h.reload).toHaveBeenCalledOnce();
     expect(h.random).toHaveBeenCalledTimes(rolls);
-    if (rolls === 0) expect(h.internals.recentEvents.at(-1)?.data?.reason).toBe("tool-filtered");
+    if (rolls === 0) expect(h.internals.presenter.recentEvents.at(-1)?.data?.reason).toBe("tool-filtered");
   });
 
   it("does not get stuck behind a rejecting filter across consecutive turns", async () => {
@@ -79,7 +80,7 @@ describe("heartbeat configuration refresh", () => {
     expect(h.random).not.toHaveBeenCalled();
     await h.save({ heartbeatTools: ["read"] });
     await h.turn(["read"]);
-    expect(h.internals.recentEvents.at(-1)?.kind).toBe("heartbeat");
+    expect(h.internals.presenter.recentEvents.at(-1)?.kind).toBe("heartbeat");
     expect(h.reload).toHaveBeenCalledTimes(2);
     expect(h.random).toHaveBeenCalledOnce();
   });
@@ -88,7 +89,7 @@ describe("heartbeat configuration refresh", () => {
     const h = await harness(["write"]);
     await h.save({ heartbeatTools: ["read"], heartbeatProbability: 0 });
     await h.turn(["read"]);
-    const event = h.internals.recentEvents.at(-1);
+    const event = h.internals.presenter.recentEvents.at(-1);
     expect(event?.kind).toBe("heartbeat");
     expect(event?.data?.activated).toEqual([]);
     expect(h.configStore.current.heartbeatProbability).toBe(0);
@@ -99,7 +100,7 @@ describe("heartbeat configuration refresh", () => {
   it("keeps text-only turns free of config reads and random draws", async () => {
     const h = await harness(["write"]);
     await h.turn([]);
-    expect(h.internals.recentEvents.at(-1)?.data?.reason).toBe("no-tool-activity");
+    expect(h.internals.presenter.recentEvents.at(-1)?.data?.reason).toBe("no-tool-activity");
     expect(h.reload).not.toHaveBeenCalled();
     expect(h.random).not.toHaveBeenCalled();
   });
@@ -109,7 +110,7 @@ describe("heartbeat configuration refresh", () => {
     await writeFile(h.configStore.configPath, "not json{");
     await h.turn(["read"]);
     expect(h.configStore.error).toBeDefined();
-    expect(h.internals.recentEvents.at(-1)?.data?.reason).toBe("tool-filtered");
+    expect(h.internals.presenter.recentEvents.at(-1)?.data?.reason).toBe("tool-filtered");
     expect(h.random).not.toHaveBeenCalled();
   });
 });

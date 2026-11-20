@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { parseShadowMarkdown } from "../src/registry.js";
+import { mkdir, mkdtemp, rm, symlink, unlink, utimes, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { parseShadowMarkdown, ShadowRegistry } from "../src/registry.js";
 
 describe("parseShadowMarkdown", () => {
   it("applies shadow defaults", () => {
@@ -104,5 +107,61 @@ describe("parseShadowMarkdown", () => {
       "C:/tmp/quick-check.md",
     );
     expect(shadow.thinkingLevel).toBe("off");
+  });
+});
+
+describe("ShadowRegistry.load", () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true });
+  });
+
+  async function makeRegistry() {
+    const dir = await mkdtemp(join(tmpdir(), "shadow-reg-"));
+    dirs.push(dir);
+    const registry = new ShadowRegistry(dir);
+    await registry.initialize();
+    return { dir, registry };
+  }
+
+  it("loads definitions, reloads when size/ctime changes under identical mtime, and removes deleted entries", async () => {
+    const { registry } = await makeRegistry();
+    const aPath = join(registry.directory, "a.md");
+    const fixedTime = new Date("2026-01-01T00:00:00.000Z");
+
+    await writeFile(aPath, "---\nid: alpha\n---\nPrompt v1.", "utf8");
+    await utimes(aPath, fixedTime, fixedTime);
+    const first = await registry.load();
+    expect(first.shadows.map((s) => s.prompt)).toEqual(["Prompt v1."]);
+
+    // Rewrite with same mtime (different length + ctime) — must not serve stale cache.
+    await writeFile(aPath, "---\nid: alpha\n---\nPrompt v2 updated!", "utf8");
+    await utimes(aPath, fixedTime, fixedTime);
+    const second = await registry.load();
+    expect(second.shadows.map((s) => s.prompt)).toEqual(["Prompt v2 updated!"]);
+
+    await unlink(aPath);
+    const third = await registry.load();
+    expect(third.shadows).toEqual([]);
+  });
+
+  it("isolates invalid markdown, duplicate ids, non-regular entries, and broken symlinks", async () => {
+    const { dir, registry } = await makeRegistry();
+    await writeFile(join(registry.directory, "01-good.md"), "---\nid: good\n---\nCheck facts.", "utf8");
+    await writeFile(join(registry.directory, "02-dup.md"), "---\nid: good\n---\nDuplicate id.", "utf8");
+    await writeFile(join(registry.directory, "03-bad.md"), "no frontmatter", "utf8");
+    await mkdir(join(registry.directory, "04-dir.md"));
+    try {
+      await symlink(join(dir, "nonexistent-target.md"), join(registry.directory, "05-broken.md"));
+    } catch {
+      // Skip symlink test case if OS/filesystem denies symlinks.
+    }
+
+    const snap = await registry.load();
+    expect(snap.shadows.map((s) => s.id)).toEqual(["good"]);
+    expect(snap.shadows[0].prompt).toBe("Check facts.");
+    expect(snap.diagnostics.some((d) => d.message.includes("duplicate shadow id: good"))).toBe(true);
+    expect(snap.diagnostics.some((d) => d.message.includes("missing YAML frontmatter"))).toBe(true);
+    expect(snap.diagnostics.some((d) => d.message.includes("not a regular file"))).toBe(true);
   });
 });

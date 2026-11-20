@@ -41,7 +41,7 @@ export function resolveShadowTools(
   return { tools, missing };
 }
 
-import { buildShadowRequest, buildShadowSystemPrompt } from "./protocol.js";
+import { buildShadowRequest } from "./protocol.js";
 import { serializeTrajectory } from "./trajectory.js";
 import { createExtensionExcluder, isSelfExtension } from "./extension-filter.js";
 
@@ -163,22 +163,36 @@ export class ShadowRunner {
       assertShadowModelAuth(model, request);
       const trajectory = serializeTrajectory(request.messages);
       assertTrajectoryFits(model, [trajectory]);
-      sessionManager = await createShadowSessionManager(request);
-      const boot = await this.bootstrapSession(request, model, controller, state, sessionManager);
+      const timeoutMs = (request.shadow.timeoutSeconds ?? request.config.defaultShadowTimeoutSeconds) * 1000;
+      timeout = setTimeout(() => {
+        state.timedOut = true;
+        controller.abort();
+      }, timeoutMs);
+      sessionManager = await raceWithAbort(createShadowSessionManager(request), controller.signal);
+      const bootPromise = this.bootstrapSession(request, model, controller, state, sessionManager);
+      void bootPromise.then(
+        (late) => {
+          if (controller.signal.aborted && state.session !== late.session) {
+            this.abortSession(late.session);
+            try {
+              late.session.dispose();
+            } catch {
+              // Ignore late disposal errors.
+            }
+          }
+        },
+        () => {},
+      );
+      const boot = await raceWithAbort(bootPromise, controller.signal);
       state.session = boot.session;
       missingTools = boot.missingTools;
       thinkingLevel = boot.thinkingLevel;
       baseMessageCount = boot.session.messages.length;
       this.controllers.set(request.runId, { controller, session: boot.session });
       if (controller.signal.aborted) {
-        finalReason = "aborted";
+        finalReason = runReason(state.timedOut, state.reported, controller.signal.aborted);
         return buildRunResult({ reason: finalReason, durationMs: Date.now() - started, session: boot.session, baseMessageCount, missingTools, thinkingLevel });
       }
-      const timeoutMs = (request.shadow.timeoutSeconds ?? request.config.defaultShadowTimeoutSeconds) * 1000;
-      timeout = setTimeout(() => {
-        state.timedOut = true;
-        controller.abort();
-      }, timeoutMs);
       controller.signal.addEventListener("abort", () => this.abortSession(boot.session), { once: true });
       await boot.session.prompt(buildShadowRequest(trajectory, request.shadow));
       await boot.session.waitForIdle();
@@ -210,12 +224,14 @@ export class ShadowRunner {
       cwd: request.cwd,
       agentDir: request.agentDir,
       settingsManager,
-      systemPrompt: buildShadowSystemPrompt(request.mainSystemPrompt),
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+      systemPrompt: request.mainSystemPrompt,
       // The inherited main system prompt already embeds APPEND_SYSTEM.md,
-      // AGENTS.md and skills; keep the loader from re-discovering them so the
-      // shadow context stays a strict subset (no duplication).
+      // AGENTS.md and skills; keep extension-bundled skills suppressed too.
       appendSystemPrompt: [],
-      agentsFilesOverride: () => ({ agentsFiles: [] }),
       skillsOverride: (base) => ({ skills: [], diagnostics: base.diagnostics }),
       // Drop this plugin itself plus every extension the user excluded, so
       // session-scoped extensions (archivers, recorders) never treat an internal
@@ -229,6 +245,9 @@ export class ShadowRunner {
       }),
     });
     await resourceLoader.reload();
+    if (controller.signal.aborted) {
+      throw new Error("Shadow run aborted during bootstrap");
+    }
     const reportTool = createReportTool((content) => {
       if (state.reported || controller.signal.aborted) return;
       state.reported = true;
@@ -253,6 +272,10 @@ export class ShadowRunner {
       sessionManager,
       settingsManager,
     });
+    if (controller.signal.aborted) {
+      created.session.dispose();
+      throw new Error("Shadow run aborted during bootstrap");
+    }
     const missingTools = tools.filter((name) => !created.session.getActiveToolNames().includes(name));
     return { session: created.session, missingTools, thinkingLevel };
   }
@@ -289,23 +312,47 @@ export function usageMetrics(messages: readonly AgentMessage[]): ShadowUsage {
   let aggregate = zeroUsage();
   for (const message of messages) {
     if (message.role !== "assistant" || !message.usage) continue;
+    const usage = message.usage as Partial<ShadowUsage> & { cost?: Partial<ShadowUsage["cost"]> };
+    const cost = usage.cost;
     aggregate = addUsage(aggregate, {
       requests: 1,
-      input: message.usage.input,
-      output: message.usage.output,
-      cacheRead: message.usage.cacheRead,
-      cacheWrite: message.usage.cacheWrite,
-      totalTokens: message.usage.totalTokens,
+      input: safeUsageNumber(usage.input),
+      output: safeUsageNumber(usage.output),
+      cacheRead: safeUsageNumber(usage.cacheRead),
+      cacheWrite: safeUsageNumber(usage.cacheWrite),
+      totalTokens: safeUsageNumber(usage.totalTokens),
       cost: {
-        input: message.usage.cost.input,
-        output: message.usage.cost.output,
-        cacheRead: message.usage.cost.cacheRead,
-        cacheWrite: message.usage.cost.cacheWrite,
-        total: message.usage.cost.total,
+        input: safeUsageNumber(cost?.input),
+        output: safeUsageNumber(cost?.output),
+        cacheRead: safeUsageNumber(cost?.cacheRead),
+        cacheWrite: safeUsageNumber(cost?.cacheWrite),
+        total: safeUsageNumber(cost?.total),
       },
     });
   }
   return aggregate;
+}
+
+function safeUsageNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error("Shadow run aborted"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new Error("Shadow run aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 function createReportTool(onReport: (content: string) => void): ToolDefinition {
@@ -316,7 +363,14 @@ function createReportTool(onReport: (content: string) => void): ToolDefinition {
     promptSnippet: "Report a useful result to the main agent and end this run",
     parameters: Type.Object({ content: Type.String({ description: "The complete report for the main agent" }) }),
     async execute(_toolCallId, params) {
-      const content = (params as { content: string }).content;
+      const content = (params as { content?: unknown }).content;
+      if (typeof content !== "string" || content.trim().length === 0) {
+        return {
+          content: [{ type: "text", text: "Report rejected: content must be non-empty." }],
+          details: {},
+          isError: true,
+        };
+      }
       onReport(content);
       return { content: [{ type: "text", text: "Report delivered." }], details: {}, terminate: true };
     },

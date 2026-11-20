@@ -174,6 +174,32 @@ describe("UsageStore", () => {
     expect(reloaded.current.cost.input).toBeCloseTo(1, 12);
     expect(reloaded.current.cost.total).toBeCloseTo(1, 12);
   }, 15_000);
+
+  it("reloads external disk updates and clears prior load errors on subsequent initialize()", async () => {
+    const store = new UsageStore(agentDir);
+    const other = new UsageStore(agentDir);
+    await mkdir(join(agentDir, "shadow-minds"), { recursive: true });
+    await writeFile(store.usagePath, "{broken", "utf8");
+
+    await store.initialize();
+    expect(store.error).toBeDefined();
+    expect(store.current).toEqual(zeroUsage());
+
+    const external = usage({ requests: 5, input: 50, totalTokens: 50, cost: { input: 0.5, total: 0.5 } });
+    await writeFile(store.usagePath, JSON.stringify({ version: 1, lifetime: external }), "utf8");
+    await store.initialize();
+    expect(store.error).toBeUndefined();
+    expect(store.current).toEqual(external);
+
+    await other.initialize();
+    await other.add(usage({ requests: 1, output: 10, totalTokens: 10, cost: { output: 0.1, total: 0.1 } }));
+    await other.flush();
+
+    await store.initialize();
+    expect(store.current).toEqual(
+      usage({ requests: 6, input: 50, output: 10, totalTokens: 60, cost: { input: 0.5, output: 0.1, total: 0.6 } }),
+    );
+  });
 });
 
 async function waitUntil(condition: () => boolean): Promise<void> {

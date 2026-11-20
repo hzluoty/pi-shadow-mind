@@ -10,20 +10,21 @@ const summarizers = new Map<string, Summarizer>([
   ["ls", (result) => summarizeLines(result, "entries")],
 ]);
 
+const MAX_PREVIEW_CHARS = 120;
+
 export function summarizeToolResult(result: ToolResultLike): string {
   const summary = summarizers.get(result.toolName ?? "")?.(result) ?? summarizeGeneric(result);
   return result.isError ? `error · ${summary}` : summary;
-}
-
-export function registerToolResultSummarizer(toolName: string, summarizer: Summarizer): void {
-  summarizers.set(toolName, summarizer);
 }
 
 function summarizeLines(result: ToolResultLike, noun: string): string {
   const text = textContent(result.content);
   if (!text) return `0 ${noun}`;
   const lines = text.split(/\r?\n/).filter(Boolean);
-  const preview = compact(lines[0] ?? "");
+  const rawPreview = compact(lines[0] ?? "");
+  const preview = rawPreview.length > MAX_PREVIEW_CHARS
+    ? `${rawPreview.slice(0, MAX_PREVIEW_CHARS - 1)}…`
+    : rawPreview;
   return `${lines.length} ${noun}${preview ? ` · ${preview}` : ""}`;
 }
 

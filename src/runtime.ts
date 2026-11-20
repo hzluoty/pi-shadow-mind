@@ -35,6 +35,7 @@ import {
   type ShadowRunResult,
 } from "./shadow-runner.js";
 import { waitForSettled } from "./shutdown-drain.js";
+import { StatusPresenter, type StatusSnapshot } from "./status-presenter.js";
 import type {
   RegistrySnapshot,
   RuntimeEvent,
@@ -44,10 +45,6 @@ import type {
 import { UsageStore } from "./usage-store.js";
 import {
   addUsage,
-  formatUsageCost,
-  formatUsageDetail,
-  formatUsageSummary,
-  formatUsageTokens,
   zeroUsage,
   type ShadowUsage,
 } from "./usage.js";
@@ -102,23 +99,16 @@ export class ShadowMindRuntime {
     onReviewCompleted: (shadowIds) =>
       this.finalResponseBudget.commit(shadowIds),
   });
-  private readonly recentEvents: RuntimeEvent[] = [];
-  private readonly recentRuns: Array<{
-    shadowName: string;
-    completedAt: string;
-    result: ShadowRunResult;
-  }> = [];
+  private readonly presenter = new StatusPresenter();
   private readonly reports = new ReportBrowser();
   private readonly batcher: ReportBatcher;
   private readonly sessionLifetime = new SessionLifetime();
   private epoch = 0;
   private modelCalls = 0;
   private paused = false;
-  private panelVisible = false;
+  private shuttingDown = false;
   private latestContext?: ExtensionContext;
-  private diagnostics: string[] = [];
   private sessionUsage: ShadowUsage = zeroUsage();
-  private shadowCount = 0;
   private completedWithFinalText = false;
   private random: () => number = Math.random;
 
@@ -137,6 +127,11 @@ export class ShadowMindRuntime {
       this.pi,
       this.entityStore,
       () => this.configStore.current,
+      {
+        onMutated: async (ctx) => {
+          await this.refresh(ctx);
+        },
+      },
     );
     this.registerEvents();
     this.registerUi();
@@ -144,13 +139,14 @@ export class ShadowMindRuntime {
 
   private registerEvents(): void {
     this.pi.on("session_start", async (_event, ctx) => {
+      this.shuttingDown = false;
       this.sessionLifetime.activate();
       this.latestContext = ctx;
       this.modelCalls = 0;
       this.completedWithFinalText = false;
       this.finalResponseBudget.reset();
       this.sessionUsage = zeroUsage();
-      this.recentRuns.length = 0;
+      this.presenter.reset();
       this.reports.reset();
       await this.configStore.initialize();
       await this.usageStore.initialize();
@@ -170,6 +166,16 @@ export class ShadowMindRuntime {
       this.finalResponseBudget.reset();
       this.epoch += 1;
       this.abortAll("new-user-input");
+      this.updateStatus(ctx);
+    });
+
+    this.pi.on("session_tree", (_event, ctx) => {
+      this.latestContext = ctx;
+      this.completedWithFinalText = false;
+      this.finalResponseBudget.reset();
+      this.epoch += 1;
+      this.abortAll("session-tree");
+      this.updateStatus(ctx);
     });
 
     this.pi.on("after_provider_response", (_event, ctx) => {
@@ -196,8 +202,16 @@ export class ShadowMindRuntime {
       this.completedWithFinalText = shouldEvaluateFinalResponse(event.messages);
     });
 
-    this.pi.on("agent_settled", async (_event, ctx) => {
+    this.pi.on("agent_settled", async (event, ctx) => {
       this.latestContext = ctx;
+      if ((event as { aborted?: boolean } | undefined)?.aborted) {
+        this.completedWithFinalText = false;
+        this.epoch += 1;
+        this.abortAll("user-aborted");
+        this.record("final-response-skipped", { reason: "aborted" });
+        this.updateStatus(ctx);
+        return;
+      }
       if (!this.completedWithFinalText) {
         this.record("final-response-skipped", {
           reason: "no-final-assistant-text",
@@ -209,6 +223,7 @@ export class ShadowMindRuntime {
     });
 
     this.pi.on("session_shutdown", async (event, ctx) => {
+      this.shuttingDown = true;
       this.latestContext = ctx;
       if (
         event.reason === "quit" &&
@@ -255,15 +270,14 @@ export class ShadowMindRuntime {
         if (command === "status") {
           await this.refresh(ctx);
           ctx.ui.notify(
-            this.statusLines().join("\n"),
-            this.diagnostics.length ? "warning" : "info",
+            this.presenter.statusLines(this.statusSnapshot()).join("\n"),
+            this.presenter.hasDiagnostics(this.usageStore.error) ? "warning" : "info",
           );
         } else if (command === "hide") {
-          this.panelVisible = false;
-          ctx.ui.setWidget("shadow-mind-panel", undefined);
+          this.presenter.hidePanel(ctx);
         } else {
           await this.refresh(ctx);
-          this.panelVisible = !this.panelVisible;
+          this.presenter.togglePanel();
         }
         this.updateStatus(ctx);
       },
@@ -296,7 +310,15 @@ export class ShadowMindRuntime {
     ctx: ExtensionContext,
     executedTools: ReadonlySet<string>,
   ): Promise<void> {
+    const startEpoch = this.epoch;
     const snapshot = await this.refresh(ctx);
+    if (startEpoch !== this.epoch || this.shuttingDown) {
+      this.record("heartbeat-skipped", {
+        reason: "superseded",
+        modelCalls: this.modelCalls,
+      });
+      return;
+    }
     const config = this.configStore.current;
     if (!shouldEvaluateHeartbeat(executedTools, config.heartbeatTools)) {
       this.record("heartbeat-skipped", {
@@ -365,13 +387,14 @@ export class ShadowMindRuntime {
   }
 
   private async onFinalResponse(ctx: ExtensionContext): Promise<void> {
+    if (this.shuttingDown) return;
     if (this.batcher.hasPending) {
       await this.batcher.flush();
       return;
     }
     const request = this.completionReview.begin(this.epoch);
     const snapshot = await this.refresh(ctx);
-    if (!this.completionReview.isCurrent(request)) {
+    if (!this.completionReview.isCurrent(request) || this.shuttingDown) {
       this.record("final-response-skipped", { reason: "superseded" });
       return;
     }
@@ -493,6 +516,9 @@ export class ShadowMindRuntime {
             reason: "error",
             error: error instanceof Error ? error.message : String(error),
           });
+          if (this.latestContext && this.sessionLifetime.isActive) {
+            this.updateStatus(this.latestContext);
+          }
         } catch {
           // Error-path logging must never escalate into an unhandled rejection.
         }
@@ -507,28 +533,30 @@ export class ShadowMindRuntime {
     const activeRun = this.active.get(runId);
     this.active.delete(runId);
     this.completionReview.slotAvailable();
-    const persisted = this.usageStore.add(result.usage);
-    if (activeRun?.epoch !== this.epoch) {
-      this.completionReview.complete(activeRun?.completionReview);
-      return;
-    }
-    this.sessionUsage = addUsage(this.sessionUsage, result.usage);
-    this.recentRuns.push({
-      shadowName: shadow.name,
-      completedAt: new Date().toISOString(),
-      result,
-    });
-    if (this.recentRuns.length > 5) this.recentRuns.shift();
-    this.record("run-end", { runId, shadowId: shadow.id, ...result });
-    if (this.latestContext && this.sessionLifetime.isActive)
-      this.updateStatus(this.latestContext);
-    this.completionReview.complete(activeRun.completionReview);
-    void persisted
-      .then(() => {
-        if (this.latestContext && this.sessionLifetime.isActive)
+    try {
+      const persisted = this.usageStore.add(result.usage);
+      if (activeRun?.epoch !== this.epoch) {
+        if (this.latestContext && this.sessionLifetime.isActive) {
           this.updateStatus(this.latestContext);
-      })
-      .catch(() => {});
+        }
+        return;
+      }
+      this.sessionUsage = addUsage(this.sessionUsage, result.usage);
+      this.presenter.recordRun(shadow.name, result);
+      this.record("run-end", { runId, shadowId: shadow.id, ...result });
+      if (this.latestContext && this.sessionLifetime.isActive) {
+        this.updateStatus(this.latestContext);
+      }
+      void persisted
+        .then(() => {
+          if (this.latestContext && this.sessionLifetime.isActive) {
+            this.updateStatus(this.latestContext);
+          }
+        })
+        .catch(() => {});
+    } finally {
+      this.completionReview.complete(activeRun?.completionReview);
+    }
   }
 
   /** Deliver a report batch and own the returned promise (SessionLifetime.run rethrows non-stale errors). */
@@ -585,13 +613,12 @@ export class ShadowMindRuntime {
     const config = await this.configStore.reload();
     const registry = await this.registry.load();
     this.batcher.setWindow(config.config.resultBatchWindowMs);
-    this.shadowCount = registry.shadows.length;
-    this.diagnostics = [
+    this.presenter.setRegistrySnapshot(registry.shadows.length, [
       ...(config.error ? [`config: ${config.error}`] : []),
       ...registry.diagnostics.map(
         (item) => `${item.filePath}: ${item.message}`,
       ),
-    ];
+    ]);
     this.updateStatus(ctx);
     return registry;
   }
@@ -636,8 +663,7 @@ export class ShadowMindRuntime {
       epoch: this.epoch,
       data,
     };
-    this.recentEvents.push(event);
-    if (this.recentEvents.length > 20) this.recentEvents.shift();
+    this.presenter.recordEvent(event);
     this.sessionLifetime.run(() =>
       this.pi.appendEntry("shadow-mind-event", event),
     );
@@ -655,76 +681,18 @@ export class ShadowMindRuntime {
 
   private updateStatus(ctx: ExtensionContext): void {
     this.sessionLifetime.run(() => {
-      const diagnostics = this.usageStore.error
-        ? [...this.diagnostics, `usage: ${this.usageStore.error}`]
-        : this.diagnostics;
-      const warning =
-        diagnostics.length || this.hasRecentRunErrors() ? " !" : "";
-      const usage = `${formatUsageTokens(this.sessionUsage.totalTokens)} · ${formatUsageCost(this.sessionUsage.cost.total)}`;
-      ctx.ui.setStatus(
-        "shadow-mind",
-        this.paused
-          ? `🐙 Paused · ${usage}${warning}`
-          : `🐙 ${this.active.size} · ${usage}${warning}`,
-      );
-      if (this.panelVisible)
-        ctx.ui.setWidget("shadow-mind-panel", this.statusLines(), {
-          placement: "aboveEditor",
-        });
+      this.presenter.update(ctx, this.statusSnapshot());
     });
   }
 
-  private hasRecentRunErrors(): boolean {
-    return this.recentEvents
-      .slice(-3)
-      .some(
-        (event) =>
-          event.kind === "run-end" &&
-          (event.data?.reason === "error" || event.data?.reason === "timeout"),
-      );
+  private statusSnapshot(): StatusSnapshot {
+    return {
+      paused: this.paused,
+      activeCount: this.active.size,
+      config: this.configStore.current,
+      sessionUsage: this.sessionUsage,
+      lifetimeUsage: this.usageStore.current,
+      usageError: this.usageStore.error,
+    };
   }
-
-  private statusLines(): string[] {
-    const config = this.configStore.current;
-    const diagnostics = this.usageStore.error
-      ? [...this.diagnostics, `usage: ${this.usageStore.error}`]
-      : this.diagnostics;
-    return [
-      `🐙 Shadow Mind · ${this.paused ? "paused" : "active"} · running ${this.active.size}/${config.maxParallelShadows}`,
-      `heartbeat ${formatNumber(config.heartbeatProbability)} · batch ${config.resultBatchWindowMs}ms · timeout ${config.defaultShadowTimeoutSeconds}s · drain ${config.headlessDrainTimeoutSeconds}s · thinking ${config.defaultThinkingLevel}`,
-      `definitions: ${this.shadowCount} valid · ${this.diagnostics.length} invalid`,
-      formatUsageDetail("session", this.sessionUsage),
-      `usage lifetime · ${formatUsageSummary(this.usageStore.current)}`,
-      ...this.recentRuns
-        .slice(-3)
-        .map(
-          ({ shadowName, completedAt, result }) =>
-            `recent run · ${formatCompletedAt(completedAt)} · ${shadowName} · ${result.reason} · ${formatUsageSummary(result.usage)}`,
-        ),
-      ...diagnostics.map((diagnostic) => `diagnostic: ${diagnostic}`),
-      ...this.recentEvents.slice(-5).map((event) => {
-        const failed =
-          event.kind === "run-end" &&
-          (event.data?.reason === "error" || event.data?.reason === "timeout");
-        const detail = failed
-          ? ` ${event.data?.error ?? event.data?.reason}`
-          : "";
-        return `${new Date(event.at).toLocaleTimeString("en-GB", { hour12: false })} ${event.kind}${detail}`;
-      }),
-      "Shortcut: Alt+S toggle · Commands: /shadow toggle | pause | resume | status | hide | reports",
-    ];
-  }
-}
-
-function formatNumber(value: number): string {
-  return Number(value.toFixed(3)).toString();
-}
-
-function formatCompletedAt(completedAt: string): string {
-  return new Date(completedAt).toLocaleTimeString("en-GB", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23",
-  });
 }

@@ -1,9 +1,11 @@
+import { basename } from "node:path";
 import { Type } from "typebox";
 import type {
   ExtensionAPI,
+  ExtensionContext,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import type { ShadowConfig, ShadowTrigger } from "./types.js";
+import type { ShadowConfig, ShadowDefinition, ShadowTrigger } from "./types.js";
 import { parseConfig } from "./config.js";
 import { describeShadow, type EntityStore } from "./entity-store.js";
 import { resolveModel } from "./model-resolution.js";
@@ -40,19 +42,24 @@ const SHADOW_FIELDS = {
   prompt: Type.Optional(Type.String()),
 };
 
+export interface ManagementToolHooks {
+  onMutated?: (ctx: ExtensionContext) => Promise<void> | void;
+}
+
 export function registerManagementTools(
   pi: ExtensionAPI,
   store: EntityStore,
   getConfig: () => ShadowConfig,
+  hooks: ManagementToolHooks = {},
 ): void {
   pi.registerTool(listTool(store));
-  pi.registerTool(createTool(store));
-  pi.registerTool(updateTool(store));
-  pi.registerTool(toggleTool(store, true));
-  pi.registerTool(toggleTool(store, false));
-  pi.registerTool(deleteTool(store));
+  pi.registerTool(createTool(store, hooks));
+  pi.registerTool(updateTool(store, hooks));
+  pi.registerTool(toggleTool(store, true, hooks));
+  pi.registerTool(toggleTool(store, false, hooks));
+  pi.registerTool(deleteTool(store, hooks));
   pi.registerTool(configReadTool(store));
-  pi.registerTool(configWriteTool(store, getConfig));
+  pi.registerTool(configWriteTool(store, getConfig, hooks));
 }
 
 function listTool(store: EntityStore): ToolDefinition {
@@ -72,7 +79,7 @@ function listTool(store: EntityStore): ToolDefinition {
   );
 }
 
-function createTool(store: EntityStore): ToolDefinition {
+function createTool(store: EntityStore, hooks: ManagementToolHooks): ToolDefinition {
   return tool(
     "create_shadow",
     "Create Shadow",
@@ -80,21 +87,23 @@ function createTool(store: EntityStore): ToolDefinition {
     Type.Object({ id: ID, ...SHADOW_FIELDS, prompt: Type.String() }),
     async (_id, params, _signal, _update, ctx) => {
       const raw = params as Record<string, unknown>;
+      const prepared = await store.previewCreate(toDraft(raw));
       if (
         !(await confirm(
           ctx,
           "Create Shadow Mind",
-          `Create ${String(raw.id)} in the global registry?`,
+          formatCreateConfirmation(prepared.definition),
         ))
       )
         return textResult("Cancelled.");
-      const shadow = await store.create(toDraft(raw));
+      const shadow = await store.commitCreate(prepared);
+      await hooks.onMutated?.(ctx);
       return textResult(`Created ${describeShadow(shadow)}`);
     },
   );
 }
 
-function updateTool(store: EntityStore): ToolDefinition {
+function updateTool(store: EntityStore, hooks: ManagementToolHooks): ToolDefinition {
   return tool(
     "update_shadow",
     "Update Shadow",
@@ -102,21 +111,32 @@ function updateTool(store: EntityStore): ToolDefinition {
     Type.Object({ id: ID, ...SHADOW_FIELDS }),
     async (_id, params, _signal, _update, ctx) => {
       const raw = params as Record<string, unknown>;
+      const id = String(raw.id);
+      const prepared = await store.previewUpdate(id, toPatch(raw));
+      const diff = formatShadowDiff(prepared.current, prepared.definition);
+      if (diff.length === 0) {
+        return textResult(`No changes for ${id}.`);
+      }
       if (
         !(await confirm(
           ctx,
           "Update Shadow Mind",
-          `Apply changes to ${String(raw.id)}?`,
+          `Apply changes to ${id} (${basename(prepared.filePath)})?\n\n${diff.join("\n")}`,
         ))
       )
         return textResult("Cancelled.");
-      const shadow = await store.update(String(raw.id), toPatch(raw));
+      const shadow = await store.commitUpdate(prepared);
+      await hooks.onMutated?.(ctx);
       return textResult(`Updated ${describeShadow(shadow)}`);
     },
   );
 }
 
-function toggleTool(store: EntityStore, enabled: boolean): ToolDefinition {
+function toggleTool(
+  store: EntityStore,
+  enabled: boolean,
+  hooks: ManagementToolHooks,
+): ToolDefinition {
   const action = enabled ? "enable" : "disable";
   return tool(
     `${action}_shadow`,
@@ -125,20 +145,23 @@ function toggleTool(store: EntityStore, enabled: boolean): ToolDefinition {
     Type.Object({ id: ID }),
     async (_id, params, _signal, _update, ctx) => {
       const id = String((params as { id: string }).id);
+      const current = await store.get(id);
       if (
         !(await confirm(
           ctx,
           `${enabled ? "Enable" : "Disable"} Shadow Mind`,
-          `${action} ${id}?`,
+          `${action} ${id} (${current.name}, currently ${current.enabled ? "enabled" : "disabled"})?`,
         ))
       )
         return textResult("Cancelled.");
-      return textResult(describeShadow(await store.setEnabled(id, enabled)));
+      const updated = await store.setEnabled(id, enabled);
+      await hooks.onMutated?.(ctx);
+      return textResult(describeShadow(updated));
     },
   );
 }
 
-function deleteTool(store: EntityStore): ToolDefinition {
+function deleteTool(store: EntityStore, hooks: ManagementToolHooks): ToolDefinition {
   return tool(
     "delete_shadow",
     "Delete Shadow",
@@ -146,15 +169,17 @@ function deleteTool(store: EntityStore): ToolDefinition {
     Type.Object({ id: ID }),
     async (_id, params, _signal, _update, ctx) => {
       const id = String((params as { id: string }).id);
+      const current = await store.get(id);
       if (
         !(await confirm(
           ctx,
           "Delete Shadow Mind",
-          `Delete ${id}? Its debug logs will be kept.`,
+          `Delete ${id} (${current.name}, file ${basename(current.filePath)})? Its debug logs will be kept.`,
         ))
       )
         return textResult("Cancelled.");
       await store.delete(id);
+      await hooks.onMutated?.(ctx);
       return textResult(`Deleted ${id}; logs were retained.`);
     },
   );
@@ -173,6 +198,7 @@ function configReadTool(store: EntityStore): ToolDefinition {
 function configWriteTool(
   store: EntityStore,
   getConfig: () => ShadowConfig,
+  hooks: ManagementToolHooks,
 ): ToolDefinition {
   return tool(
     "update_shadow_config",
@@ -199,7 +225,7 @@ function configWriteTool(
       ),
     }),
     async (_id, params, _signal, _update, ctx) => {
-      const current = getConfig();
+      const current = await store.readParsedConfig(getConfig());
       const raw = params as Record<string, unknown>;
       const next = parseConfig({
         heartbeat_probability:
@@ -224,23 +250,29 @@ function configWriteTool(
         random_seed: raw.random_seed ?? current.randomSeed,
       });
       if (
+        raw.default_shadow_model !== undefined &&
         next.defaultShadowModel &&
         ctx.modelRegistry &&
         !resolveModel(ctx, next.defaultShadowModel)
       ) {
         throw new Error(
-          `unknown shadow model: ${next.defaultShadowModel}. Pass provider/modelId, e.g. magpie/autoclaw-cn/zai_glm-5.3-flash.`,
+          `unknown shadow model: ${next.defaultShadowModel}. Pass provider/modelId, e.g. openai/gpt-5-mini.`,
         );
+      }
+      const diff = formatConfigDiff(current, next);
+      if (diff.length === 0) {
+        return textResult("No changes to Shadow Mind config.");
       }
       if (
         !(await confirm(
           ctx,
           "Update Shadow Config",
-          `Apply this config?\n${JSON.stringify(next, null, 2)}`,
+          `Apply config changes?\n\n${diff.join("\n")}\n\n${JSON.stringify(next, null, 2)}`,
         ))
       )
         return textResult("Cancelled.");
       await store.writeConfig(next);
+      await hooks.onMutated?.(ctx);
       return textResult("Shadow Mind config updated.");
     },
   );
@@ -292,4 +324,76 @@ function toPatch(raw: Record<string, unknown>) {
     tools: raw.tools as string[] | undefined,
     prompt: raw.prompt as string | undefined,
   };
+}
+
+function formatCreateConfirmation(shadow: ShadowDefinition): string {
+  const toolsText = shadow.tools.length ? shadow.tools.join(", ") : "(default read-only)";
+  const lines = [
+    `Create ${shadow.id} (${shadow.name}) in ${basename(shadow.filePath)}?`,
+    `enabled: ${shadow.enabled}`,
+    `debug: ${shadow.debug}`,
+    `trigger: ${shadow.trigger.join(", ")}`,
+    `activation_probability: ${shadow.activationProbability}`,
+    `active_for_models: ${shadow.activeForModels.join(", ")}`,
+    ...(shadow.runWithModel ? [`run_with_model: ${shadow.runWithModel}`] : []),
+    ...(shadow.thinkingLevel ? [`thinking_level: ${shadow.thinkingLevel}`] : []),
+    ...(shadow.timeoutSeconds !== undefined ? [`timeout_seconds: ${shadow.timeoutSeconds}`] : []),
+    ...(shadow.finalResponseRounds !== undefined ? [`final_response_rounds: ${shadow.finalResponseRounds}`] : []),
+    ...(shadow.activationTools.length ? [`activation_tools: ${shadow.activationTools.join(", ")}`] : []),
+    `tools: ${toolsText}`,
+    "",
+    "prompt:",
+    shadow.prompt,
+  ];
+  return lines.join("\n");
+}
+
+function formatShadowDiff(current: ShadowDefinition, next: ShadowDefinition): string[] {
+  const fields: Array<[string, unknown, unknown]> = [
+    ["name", current.name, next.name],
+    ["enabled", current.enabled, next.enabled],
+    ["debug", current.debug, next.debug],
+    ["activation_probability", current.activationProbability, next.activationProbability],
+    ["trigger", current.trigger, next.trigger],
+    ["active_for_models", current.activeForModels, next.activeForModels],
+    ["run_with_model", current.runWithModel, next.runWithModel],
+    ["thinking_level", current.thinkingLevel, next.thinkingLevel],
+    ["timeout_seconds", current.timeoutSeconds, next.timeoutSeconds],
+    ["final_response_rounds", current.finalResponseRounds, next.finalResponseRounds],
+    ["activation_tools", current.activationTools, next.activationTools],
+    ["tools", current.tools, next.tools],
+  ];
+  const diffs = fields
+    .filter(([, oldVal, newVal]) => !sameValue(oldVal, newVal))
+    .map(([name, oldVal, newVal]) => `${name}: ${formatValue(oldVal)} -> ${formatValue(newVal)}`);
+  if (current.prompt !== next.prompt) {
+    diffs.push(`prompt:\n--- before ---\n${current.prompt}\n--- after ---\n${next.prompt}`);
+  }
+  return diffs;
+}
+
+function formatConfigDiff(current: ShadowConfig, next: ShadowConfig): string[] {
+  const fields: Array<[string, unknown, unknown]> = [
+    ["heartbeat_probability", current.heartbeatProbability, next.heartbeatProbability],
+    ["heartbeat_tools", current.heartbeatTools, next.heartbeatTools],
+    ["max_parallel_shadows", current.maxParallelShadows, next.maxParallelShadows],
+    ["default_shadow_timeout_seconds", current.defaultShadowTimeoutSeconds, next.defaultShadowTimeoutSeconds],
+    ["headless_drain_timeout_seconds", current.headlessDrainTimeoutSeconds, next.headlessDrainTimeoutSeconds],
+    ["result_batch_window_ms", current.resultBatchWindowMs, next.resultBatchWindowMs],
+    ["excluded_extensions", current.excludedExtensions, next.excludedExtensions],
+    ["default_shadow_model", current.defaultShadowModel, next.defaultShadowModel],
+    ["default_thinking_level", current.defaultThinkingLevel, next.defaultThinkingLevel],
+    ["random_seed", current.randomSeed, next.randomSeed],
+  ];
+  return fields
+    .filter(([, oldVal, newVal]) => !sameValue(oldVal, newVal))
+    .map(([name, oldVal, newVal]) => `${name}: ${formatValue(oldVal)} -> ${formatValue(newVal)}`);
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function formatValue(value: unknown): string {
+  return value === undefined ? "(unset)" : JSON.stringify(value);
 }

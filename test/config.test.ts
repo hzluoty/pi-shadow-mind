@@ -1,5 +1,9 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_CONFIG, parseConfig, serializeConfig } from "../src/config.js";
+import { ConfigStore, DEFAULT_CONFIG, parseConfig, serializeConfig } from "../src/config.js";
 
 describe("parseConfig", () => {
   it("uses built-in defaults", () => {
@@ -66,5 +70,41 @@ describe("parseConfig", () => {
     expect(parseConfig({ random_seed: 42 }).randomSeed).toBe(42);
     expect(() => parseConfig({ random_seed: -1 })).toThrow(/random_seed/);
     expect(() => parseConfig({ random_seed: 1.5 })).toThrow(/random_seed/);
+  });
+});
+
+describe("ConfigStore", () => {
+  it("creates default config safely under concurrent initialize calls", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "shadow-config-store-"));
+    try {
+      const a = new ConfigStore(dir);
+      const b = new ConfigStore(dir);
+      await Promise.all([a.initialize(), b.initialize()]);
+      expect(a.current).toEqual(DEFAULT_CONFIG);
+      expect(b.current).toEqual(DEFAULT_CONFIG);
+      expect(a.error).toBeUndefined();
+      expect(b.error).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("retains last-known-good config when the file becomes invalid", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "shadow-config-lkg-"));
+    try {
+      const store = new ConfigStore(dir);
+      await store.initialize();
+      await writeFile(store.configPath, JSON.stringify({ max_parallel_shadows: 4 }), "utf8");
+      await store.reload();
+      expect(store.current.maxParallelShadows).toBe(4);
+      expect(store.error).toBeUndefined();
+
+      await writeFile(store.configPath, "{broken", "utf8");
+      await store.reload();
+      expect(store.current.maxParallelShadows).toBe(4);
+      expect(store.error).toBeDefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -1,25 +1,25 @@
 import { describe, expect, it, vi } from "vitest";
 import { resolveModel } from "../src/model-resolution.js";
-import { buildRunResult, resolveRunModel, resolveRunThinkingLevel, resolveShadowTools, toolMetrics } from "../src/shadow-runner.js";
+import { buildRunResult, resolveRunModel, resolveRunThinkingLevel, resolveShadowTools, toolMetrics, usageMetrics } from "../src/shadow-runner.js";
 import { zeroUsage } from "../src/usage.js";
 
-const fullRegistry = new Set(["read", "ffgrep", "fffind", "write", "bash", "edit", "custom-tool", "report_to_main"]);
+const fullRegistry = new Set(["read", "grep", "find", "ls", "write", "bash", "edit", "custom-tool", "report_to_main"]);
 
 describe("resolveShadowTools", () => {
   it("keeps defaults, whitelist additions, and the built-in report tool", () => {
     const { tools, missing } = resolveShadowTools(["write"], fullRegistry);
-    expect(tools).toEqual(["read", "ffgrep", "fffind", "write", "report_to_main"]);
+    expect(tools).toEqual(["read", "grep", "find", "ls", "write", "report_to_main"]);
     expect(missing).toEqual([]);
   });
 
   it("deduplicates overlapping names", () => {
     const { tools } = resolveShadowTools(["read", "write", "read"], fullRegistry);
-    expect(tools).toEqual(["read", "ffgrep", "fffind", "write", "report_to_main"]);
+    expect(tools).toEqual(["read", "grep", "find", "ls", "write", "report_to_main"]);
   });
 
   it("drops whitelist tools missing from the session registry and reports them", () => {
     const { tools, missing } = resolveShadowTools(["nonexistent-tool", "bash"], fullRegistry);
-    expect(tools).toEqual(["read", "ffgrep", "fffind", "bash", "report_to_main"]);
+    expect(tools).toEqual(["read", "grep", "find", "ls", "bash", "report_to_main"]);
     expect(missing).toEqual(["nonexistent-tool"]);
   });
 
@@ -38,7 +38,7 @@ describe("resolveShadowTools", () => {
   it("always keeps report_to_main even when it is not in the available set", () => {
     const { tools, missing } = resolveShadowTools([], new Set(["read"]));
     expect(tools).toEqual(["read", "report_to_main"]);
-    expect(missing).toEqual(["ffgrep", "fffind"]);
+    expect(missing).toEqual(["grep", "find", "ls"]);
   });
 });
 
@@ -239,5 +239,48 @@ describe("resolveModel and resolveRunModel", () => {
 
     expect(resolveRunModel({ ...base, shadow: { runWithModel: `${glm.provider}/${glm.id}` }, config: {} })).toBe(glm);
     expect(resolveRunModel({ ...base, config: {} })).toBe(deepseek);
+  });
+});
+
+describe("usageMetrics", () => {
+  it("clamps missing cost objects and non-finite or negative provider usage values to zero", () => {
+    const metrics = usageMetrics([
+      {
+        role: "assistant",
+        usage: {
+          input: Number.NaN,
+          output: -5,
+          cacheRead: Infinity,
+          cacheWrite: 3,
+          totalTokens: 10,
+        },
+      } as any,
+      {
+        role: "assistant",
+        usage: {
+          input: 7,
+          output: 2,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 9,
+          cost: {
+            input: 0.01,
+            output: Number.NaN,
+            cacheRead: -1,
+            cacheWrite: undefined,
+            total: 0.01,
+          },
+        },
+      } as any,
+    ]);
+    expect(metrics).toEqual({
+      requests: 2,
+      input: 7,
+      output: 2,
+      cacheRead: 0,
+      cacheWrite: 3,
+      totalTokens: 19,
+      cost: { input: 0.01, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 },
+    });
   });
 });

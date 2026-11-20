@@ -114,9 +114,12 @@ function removeOrphanedTools(messages: Message[]): Message[] {
     const calls = toolCalls(message);
     if (!calls.length || message.role !== "assistant") return [message];
     const retained = calls.filter((call) => call.name === "compress" || resultIds.has(call.id));
-    if (!retained.length) return [];
     const ids = new Set(retained.map((call) => call.id));
-    return [{ ...message, content: message.content.filter((part) => part.type !== "toolCall" || ids.has(part.id)) }];
+    const content = message.content.filter((part) => part.type !== "toolCall" || ids.has(part.id));
+    const hasContent = content.some(
+      (part) => part.type === "toolCall" || (part.type === "text" && part.text.trim().length > 0),
+    );
+    return hasContent ? [{ ...message, content }] : [];
   });
   const callIds = new Set(paired.flatMap((message) => toolCalls(message).map((call) => call.id)));
   return paired.filter((message) => message.role !== "toolResult" || callIds.has(message.toolCallId));

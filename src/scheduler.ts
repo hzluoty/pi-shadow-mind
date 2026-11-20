@@ -45,6 +45,14 @@ export function shouldEvaluateFinalResponse(
     (message as { role?: unknown }).role !== "assistant"
   )
     return false;
+  const stopReason = (message as { stopReason?: unknown }).stopReason;
+  if (
+    stopReason !== undefined &&
+    stopReason !== "stop" &&
+    stopReason !== "length"
+  ) {
+    return false;
+  }
   const content = (message as { content?: unknown }).content;
   if (typeof content === "string") return content.trim().length > 0;
   return (
@@ -211,14 +219,13 @@ function modelPatternMatches(pattern: string, fullModelId: string): boolean {
   const modelId =
     slashIndex !== -1 ? fullModelId.slice(slashIndex + 1) : fullModelId;
 
-  if (!pattern.includes("/") && pattern === modelId) {
+  if (pattern === modelId) {
     return true;
   }
 
   if (pattern.includes("*")) {
     const regex = wildcardToRegex(pattern);
-    if (regex.test(fullModelId)) return true;
-    if (!pattern.includes("/") && regex.test(modelId)) return true;
+    if (regex.test(fullModelId) || regex.test(modelId)) return true;
   }
 
   return false;
